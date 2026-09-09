@@ -1,0 +1,16 @@
+# Working files — the active plan/checklist live here, never committed.
+# Committed plan snapshots go in docs/plans/ instead.
+tasks/
+
+# Environments
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Sub-repos are their own git repositories, not submodules.
+pikol-backend/
+pikol-frontend/
