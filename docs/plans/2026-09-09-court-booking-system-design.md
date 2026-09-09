@@ -1,8 +1,8 @@
 # Pikol — Pickleball Court Booking System — Design
 
 **Date:** 2026-09-09
-**Status:** 🚧 In progress — product, data model, booking lifecycle, auth, and
-API surface designed and approved. Frontend and deployment pending.
+**Status:** 🚧 In progress — product, data model, booking lifecycle, auth, API
+surface, and frontend designed and approved. Deployment pending.
 **Scope:** Full system design for a single-owner, multi-venue pickleball court
 booking platform with online payments, ahead of any implementation.
 
@@ -648,12 +648,100 @@ Each is easy to miss and each breaks delivery silently:
 
 ---
 
-## 8. Still to design
+## 8. Frontend
 
-- **Frontend**: public booking surface + staff console, feature slices
-- **Deployment**: Vercel + Render + Supabase, environments, CI
+Same stack as asima: Next.js 15 App Router, TanStack Query, react-hook-form +
+zod, Tailwind with shadcn/radix, sonner. Feature slices under `src/features/`,
+shared primitives under `src/components/{ui,form,layout}`.
 
-## 9. Open questions
+The structural difference from asima is **two audiences in one deployment**,
+which lands on asima's own route-group shape because nothing is public:
+
+```
+src/app/
+├── (auth)/       login · register · verify-email · accept-invite · forgot/reset
+└── (app)/        everything else, JWT required
+    ├── venues/              venue list → court list → availability → book
+    ├── bookings/            my bookings, detail
+    ├── checkout/return/     PayMongo redirect target
+    └── staff/               permission-gated console
+        └── schedule · bookings · courts · pricing · closures · users · parameters
+```
+
+`/` is a redirect: players to venues, staff to today's schedule, everyone else
+to login. Navigation is driven from `GET /users/me/permissions`, never by
+parsing a role client-side.
+
+### 8.1 The availability grid
+
+One component, both surfaces. **Time runs vertically (rows), courts run
+horizontally (columns)**, with the court header row and the time column both
+sticky.
+
+```
+┌──────┬──────┬──────┬──────┐
+│ SEP  │  C1  │  C2  │  C3  │ ← sticky
+├──────┼──────┼──────┼──────┤
+│ 5 PM │ ₱500 │  ██  │ ₱500 │
+│ 6 PM │ ₱600 │ ₱600 │  ██  │  ← peak pricing visible in-cell
+│ 7 PM │  ██  │ ₱600 │ ₱600 │
+└──────┴──────┴──────┴──────┘
+        ↕ one natural scroll through 24h
+```
+
+Chosen because **vertical scrolling is the phone's native gesture** and PH
+players are overwhelmingly mobile: 24 hours becomes one thumb scroll rather
+than an easy-to-miss horizontal swipe. The same layout serves desktop and the
+staff console unchanged — desktop simply shows more rows without scrolling —
+so there is one grid component, not two.
+
+Price is rendered **in the cell**, which makes peak pricing legible at a glance
+without a legend and without a second lookup.
+
+**Consecutive-hour selection** is tap-start then tap-end within one column, not
+drag: every cell between must be free and in the same court. Tap ranges are far
+more reliable than drag on touch, and the same interaction works with a mouse.
+
+**Known limit:** beyond ~8 courts the columns squeeze on a phone. The mitigation
+is horizontal scroll on the court axis with the time column pinned — deferred
+until a venue actually has that many courts.
+
+### 8.2 Four things that are easy to get wrong
+
+**Slot selection must not be optimistic.** The `409` from
+`uq_court_slot_active` is an expected outcome on a busy Friday, not an edge
+case. Showing a slot as "yours" before the server confirms means walking it
+back, which reads as a bug. Tap → server → *then* held.
+
+**The hold needs a visible countdown.** The player has 15 minutes and no way to
+know unless told. A timer on the checkout screen, and an honest expiry state
+when it lapses — never a silent failure at PayMongo.
+
+**The return page polls; it does not trust the redirect.** PayMongo bounces the
+player back, but the webhook may not have landed — it often arrives *before*
+the redirect, sometimes seconds after. The return page shows "confirming your
+booking", polls `GET /bookings/me/{id}` briefly, then declares success or
+points at My Bookings. This is the frontend half of *the webhook is the only
+authority*.
+
+**All times render Asia/Manila, never browser-local**, or a player booking from
+Dubai books 4am. And the derived `IN_PROGRESS` status comes **from the server**,
+never recomputed client-side — a skewed browser clock would otherwise show a
+session in progress that has not started.
+
+### 8.3 One build-time guard, learned from asima
+
+A production build with `NEXT_PUBLIC_API_BASE_URL` unset must **fail**, not
+succeed while baking `localhost` into the client bundle. Asima shipped that
+silent failure once; it is cheap to prevent here from the first commit.
+
+---
+
+## 9. Still to design
+
+- **Deployment** — Vercel + Render + Supabase, environments, CI
+
+## 10. Open questions
 
 - **BIR official receipts.** PH businesses are legally required to issue them.
   Assumed handled outside this system — recorded as a decision, not a surprise.
