@@ -1,7 +1,8 @@
 # Pikol — Pickleball Court Booking System — Design
 
 **Date:** 2026-09-09
-**Status:** 🚧 In progress — Sections 1–2 designed and approved. Sections 3–6 pending.
+**Status:** 🚧 In progress — Sections 1–3 designed and approved. API surface,
+frontend, and deployment pending.
 **Scope:** Full system design for a single-owner, multi-venue pickleball court
 booking platform with online payments, ahead of any implementation.
 
@@ -186,13 +187,15 @@ parameters      key PK, value, value_type, description, updated_at, updated_by
 roles           id, code, name
 permissions     id, code                       -- RESOURCE:Action
 users           id, email, password_hash, full_name, mobile,
-                role_id, venue_id?, is_active
+                role_id, venue_id?, is_active, email_verified_at?
+user_tokens     id, user_id, purpose, token_hash, expires_at, used_at?
 venues          id, name, address, is_active
 courts          id, venue_id, name, slot_minutes=60, is_active
 price_rules     id, court_id, day_of_week?, hour_of_day?, price_centavos
 booking_groups  id, court_id, player_id?, type, booking_status, payment_status,
                 price_centavos, fee_centavos, total_centavos, payment_method,
-                expires_at?, created_by_user_id, cancelled_at?, notes?
+                expires_at?, created_by_user_id, cancelled_at?,
+                cancelled_by_user_id?, cancellation_reason?, notes?
 booking_slots   id, booking_group_id, court_id, starts_at, ends_at,
                 price_centavos, booking_status
 payments        id, booking_group_id, provider, provider_checkout_id,
@@ -439,14 +442,107 @@ domain layer or the database.
 
 ---
 
-## 6. Still to design
+## 6. Auth, permissions, and venue scoping
 
-- **Section 3** — Auth, roles, permission codes, venue scoping enforcement
-- **Section 4** — API surface (endpoint-by-endpoint)
+### 6.1 Carried from asima unchanged
+
+One `users` table — a player is `role = PLAYER`, not a separate identity
+system. Bearer JWT, 15-minute access token, 7-day refresh with rotation and
+server-side revocation (asima ADR 0002). Permission codes stay
+`RESOURCE:Action`; the frontend gates UI from `GET /users/me/permissions`
+rather than parsing roles client-side. `SUPER_ADMIN` is an unconditional
+bypass axis, orthogonal to permissions, as in asima ADR 0001.
+
+`user_tokens` serves both password reset and email verification via a
+`purpose` column: single-use, hashed at rest, short-lived. Login,
+registration, reset-request, and verification-resend are all rate limited.
+
+### 6.2 Venue scoping — the new security surface
+
+Asima is single-tenant and has nothing to copy here. The threat is concrete: a
+`VENUE_MANAGER` at Venue A calling `GET /admin/bookings?venue_id=B`, or
+`PATCH /admin/courts/{id}` for a court that is not theirs.
+
+**The failure mode to design against is forgetting.** One repository method
+that omits the venue filter leaks everything, and it looks entirely normal in
+review. So scope is a **mandatory parameter, never optional**:
+
+```python
+class VenueScope:          # resolved once, from the token, by a dependency
+    all_venues: bool       # SUPER_ADMIN
+    venue_id: int | None   # VENUE_MANAGER / VENUE_STAFF
+```
+
+Every repository method touching venue-owned data takes `scope: VenueScope` as
+a **required argument with no default**. Omitting it is a `TypeError` at call
+time rather than a silent data leak in production. The insecure version must
+fail to run, not fail quietly.
+
+For `/{id}` routes the check is ownership-after-fetch, returning **404, not
+403** — a 403 confirms existence, which tells a manager at Venue A exactly how
+many courts Venue B has.
+
+### 6.3 Role → permission map
+
+| | SUPER_ADMIN | VENUE_MANAGER | VENUE_STAFF | PLAYER |
+|---|---|---|---|---|
+| Scope | all venues | own venue | own venue | self |
+| `VENUE:Manage` | ✅ | — | — | — |
+| `COURT:Manage` | ✅ | ✅ | — | — |
+| `PRICE:Manage` | ✅ | ✅ | — | — |
+| `CLOSURE:Manage` | ✅ | ✅ | ✅ | — |
+| `BOOKING:ReadAny` | ✅ | ✅ | ✅ | — |
+| `BOOKING:CreateWalkIn` | ✅ | ✅ | ✅ | — |
+| `BOOKING:MarkPaid` | ✅ | ✅ | ✅ | — |
+| `BOOKING:SetOutcome` | ✅ | ✅ | ✅ | — |
+| `BOOKING:CancelAny` | ✅ | ✅ | ✅ | — |
+| `USER:Manage` | ✅ | ✅ (staff only) | — | — |
+| `PARAMETER:Manage` | ✅ | — | — | — |
+
+`parameters` is global and moves money (fee percentage, default price), so it
+stays admin-only. A venue manager adjusts pricing through `price_rules` on
+their own courts instead.
+
+### 6.4 Consequences of these grants
+
+**A manager creating users is a privilege-escalation surface.** Two rules
+close it, and they are the same rule asima applies to identity:
+
+- A `VENUE_MANAGER` may create **`VENUE_STAFF` only**. Minting another manager
+  is a `SUPER_ADMIN` act.
+- `venue_id` on a created user is **taken from the creator token, never from
+  the request body** — the same reason `/users/me` has no `:id` segment.
+
+**Staff cancellation needs an audit trail.** With no refunds, a wrongly
+cancelled paid booking is a customer-service incident. `cancelled_by_user_id`
+and a required `cancellation_reason` make it reviewable; both are cheap.
+
+**A closure can never evict a booking.** `uq_court_slot_active` already
+forbids it — staff must cancel the booking first, deliberately and on the
+record. No extra logic needed; the constraint does it.
+
+### 6.5 Email verification
+
+Players must verify their email before booking. The gate is placed at
+**booking, not login** — an unverified player can sign in and browse, and sees
+a persistent prompt with a rate-limited resend. Blocking login instead would
+strand people with no path back.
+
+**This puts email on the signup critical path.** A provider outage or a
+spam-foldered message now costs a booking, where previously email was
+convenience only. Two mitigations: keep the resend action obvious in the UI,
+and configure SPF/DKIM on the sending domain from day one rather than after
+the first "I never got the email" report.
+
+---
+
+## 7. Still to design
+
+- **Section 4** — API surface, endpoint by endpoint
 - **Section 5** — Frontend: public booking surface + staff console, feature slices
-- **Section 6** — Deployment: Vercel + Render + Supabase, envs, CI
+- **Section 6** — Deployment: Vercel + Render + Supabase, environments, CI
 
-## 7. Open questions
+## 8. Open questions
 
 - **BIR official receipts.** PH businesses are legally required to issue them.
   Assumed handled outside this system — recorded as a decision, not a surprise.
