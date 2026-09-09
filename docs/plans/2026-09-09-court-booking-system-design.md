@@ -186,9 +186,10 @@ and approval chains. A `Venue { id, name, address }` does not.
 parameters      key PK, value, value_type, description, updated_at, updated_by
 roles           id, code, name
 permissions     id, code                       -- RESOURCE:Action
-users           id, email, password_hash, full_name, mobile,
+users           id, email, password_hash?, full_name, mobile,
                 role_id, venue_id?, is_active, email_verified_at?
 user_tokens     id, user_id, purpose, token_hash, expires_at, used_at?
+                -- purpose: EMAIL_VERIFICATION | PASSWORD_RESET | INVITATION
 venues          id, name, address, is_active
 courts          id, venue_id, name, slot_minutes=60, is_active
 price_rules     id, court_id, day_of_week?, hour_of_day?, price_centavos
@@ -503,36 +504,73 @@ many courts Venue B has.
 stays admin-only. A venue manager adjusts pricing through `price_rules` on
 their own courts instead.
 
-### 6.4 Consequences of these grants
+### 6.4 Why a manager creating users needs two fixed fields
 
-**A manager creating users is a privilege-escalation surface.** Two rules
-close it, and they are the same rule asima applies to identity:
+A manager creating his own staff is a requirement, not a risk. The risk is in
+the naive implementation, which checks only *may this caller create users?* and
+then takes `role_id` and `venue_id` from a body the manager controls:
 
-- A `VENUE_MANAGER` may create **`VENUE_STAFF` only**. Minting another manager
-  is a `SUPER_ADMIN` act.
-- `venue_id` on a created user is **taken from the creator token, never from
-  the request body** — the same reason `/users/me` has no `:id` segment.
+```jsonc
+POST /api/v1/admin/users
+{ "email": "me2@x.com", "role_id": 1, "venue_id": null }   // 1 = SUPER_ADMIN
+```
 
-**Staff cancellation needs an audit trail.** With no refunds, a wrongly
-cancelled paid booking is a customer-service incident. `cancelled_by_user_id`
-and a required `cancellation_reason` make it reviewable; both are cheap.
+He accepts his own invitation and owns every venue. The quieter variant is
+worse:
 
-**A closure can never evict a booking.** `uq_court_slot_active` already
-forbids it — staff must cancel the booking first, deliberately and on the
-record. No extra logic needed; the constraint does it.
+```jsonc
+{ "email": "me3@x.com", "role_id": 3, "venue_id": 7 }      // someone else's venue
+```
 
-### 6.5 Email verification
+That produces a legitimate staff account at Venue 7. Every `VenueScope` check
+passes, because the token genuinely says Venue 7. **Scoping is not bypassed —
+it has been handed a valid credential**, and nothing looks wrong in any log.
 
-Players must verify their email before booking. The gate is placed at
-**booking, not login** — an unverified player can sign in and browse, and sees
-a persistent prompt with a rate-limited resend. Blocking login instead would
-strand people with no path back.
+So on the manager-facing endpoint both fields are fixed by the server:
 
-**This puts email on the signup critical path.** A provider outage or a
-spam-foldered message now costs a booking, where previously email was
-convenience only. Two mitigations: keep the resend action obvious in the UI,
-and configure SPF/DKIM on the sending domain from day one rather than after
-the first "I never got the email" report.
+```python
+role_id  = VENUE_STAFF        # fixed by the endpoint, not chosen by the caller
+venue_id = caller.venue_id    # from the token, never the body
+```
+
+`SUPER_ADMIN` keeps a separate endpoint where role and venue *are* parameters,
+because an admin choosing them is the legitimate case. This is the same
+principle that keeps `/users/me` free of an `:id` segment: **anything a caller
+could use to widen their own authority comes from the token, never from input
+they control.**
+
+### 6.5 Two audit fields on cancellation
+
+With no refunds, a wrongly cancelled paid booking is a customer-service
+incident. `booking_groups` carries `cancelled_by_user_id` and a **required**
+`cancellation_reason` alongside `cancelled_at`. Both are cheap and make staff
+cancellations reviewable.
+
+A closure can never evict a booking: `uq_court_slot_active` forbids it, so
+staff must cancel first, deliberately and on the record. The constraint does
+this; no extra logic exists.
+
+### 6.6 Email verification and staff invitation
+
+**Players self-register and verify at signup.** The account is created
+inactive; the verification link activates it. Login before verification fails
+with a distinct error that renders a resend action, so nobody is stranded by a
+spam-foldered message.
+
+**Staff are invited, not registered** — same email machinery, different shape.
+The manager creates the account with **no password at all**
+(`password_hash = NULL`, `is_active = false`) and the system emails an
+invitation token. The staff member clicks, sets their *own* password, and the
+account activates: verification and password creation in one step. The manager
+never sets, knows, or transmits a password, which removes the temp-password-
+over-Messenger habit before it starts.
+
+Invitations expire after 7 days and are resendable and revocable.
+
+**This puts email on the critical path for both signup and hiring.** A provider
+outage or a spam-foldered message now costs a booking or a shift. Configure
+SPF/DKIM on the sending domain from day one rather than after the first "I
+never got the email" report, and keep the resend action obvious in the UI.
 
 ---
 
