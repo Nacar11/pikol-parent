@@ -49,6 +49,14 @@ These apply to every task in every Pikol backend plan.
   `expires_at > now()`.** Not applicable until Phase 4, listed here because it
   is a project-wide rule with no exceptions. (spec §4.3)
 
+## Working rule: format before you commit
+
+Run `uv run ruff format .` before every commit. The code blocks in this plan
+show **content, not final formatting** — magic trailing commas and line
+breaks will differ from ruff's output, and CI runs `ruff format --check`.
+Formatting first means the gate never fails on whitespace, and the diff you
+commit is the one ruff would produce.
+
 ## File Structure
 
 ```
@@ -161,6 +169,20 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
+[tool.ruff.lint.flake8-bugbear]
+# `session: AsyncSession = Depends(get_session)` is THE FastAPI idiom, and
+# B008 ("no function call in an argument default") flags every one of them.
+# Without this the lint gate fails on the first router that takes a
+# dependency — which is all of them, from Phase 2 onward.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Security",
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -191,7 +213,9 @@ uv sync
 
 - [ ] **Step 2: Write the failing test**
 
-`tests/conftest.py`:
+`tests/conftest.py` (Task 3 replaces this file with the database-aware
+version — imports go in the header block, never appended at the bottom, or
+ruff's `E402` fails the lint gate):
 
 ```python
 from collections.abc import AsyncGenerator
@@ -569,7 +593,9 @@ Expected: PASS — 1 passed
 
 - [ ] **Step 6: Write the failing readiness test**
 
-Append to `tests/health/test_health.py`:
+Add to `tests/health/test_health.py` — the test goes at the end, but any new
+import belongs in the header block. Imports appended below existing code trip
+ruff's `E402`, and `ruff check .` covers `tests/`:
 
 ```python
 async def test_readiness_touches_the_database(client: AsyncClient) -> None:
@@ -627,26 +653,45 @@ async def ready(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
     return {"status": "ready", "database": "ok"}
 ```
 
-- [ ] **Step 9: Add a rollback fixture for database tests**
+- [ ] **Step 9: Replace `tests/conftest.py` with the database-aware version**
 
-Every test from Phase 2 onward writes rows. Without this, tests leak state
-into each other and pass or fail depending on order — and retrofitting it
-later means rewriting every test written before it.
+**Replace the whole file** — do not append. Appending imports to the bottom
+trips ruff's `E402` and `I001`, and `ruff check .` covers `tests/`, so the
+lint gate would fail.
 
-Append to `tests/conftest.py`:
+Two things here are load-bearing and neither is obvious:
 
 ```python
+from collections.abc import AsyncGenerator
+
+import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.database.session import engine
+from src.database.session import engine, get_session
+from src.main import create_app
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_engine_between_tests() -> AsyncGenerator[None, None]:
+    """pytest-asyncio gives every test its own event loop.
+
+    The module-level engine pools connections, so one checked out under test
+    A's loop is handed back and reused under test B's — and asyncpg raises
+    `RuntimeError: Future attached to a different loop`, or `Event loop is
+    closed`. It looks like flakiness and it is not: it is deterministic once
+    two tests touch the database. Disposing after each test means no
+    connection outlives the loop that created it.
+    """
+    yield
+    await engine.dispose()
 
 
 @pytest.fixture
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """A session inside a transaction that is always rolled back.
 
-    The test sees its own writes; the database never does. Nothing a test
-    writes can reach the next test.
+    The test sees its own writes; the database never does.
     """
     async with engine.connect() as connection:
         transaction = await connection.begin()
@@ -656,12 +701,29 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         finally:
             await session.close()
             await transaction.rollback()
+
+
+@pytest.fixture
+async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """The app, with its session dependency pointed at the rolling-back one.
+
+    Without this override the app opens its OWN session on the real engine
+    and commits for real — so the rollback fixture would guarantee nothing
+    about anything a request writes, which is most of what Phase 2 onward
+    tests. The fixture would be decorative.
+    """
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: db_session
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
 ```
 
 - [ ] **Step 10: Run the full suite**
 
-Run: `uv run pytest -v`
-Expected: PASS — 6 passed
+Run: `uv run ruff format . && uv run pytest -v`
+Expected: PASS — 7 passed
 
 - [ ] **Step 11: Commit**
 
@@ -713,7 +775,7 @@ Appendix A rather than inferred from the diagram.
 from datetime import datetime
 
 from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy import Enum as SAEnum
+from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.database.base import Base
@@ -731,11 +793,19 @@ class ParameterModel(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
+    # postgresql.ENUM, not the generic sqlalchemy.Enum: `create_type` is a
+    # PG-dialect parameter, and the generic type SWALLOWS it silently — the
+    # object ends up with no create_type at all and keeps default
+    # create-with-table behaviour. Any metadata.create_all() or autogenerate
+    # then emits CREATE TYPE a second time and fails with "type already
+    # exists", which is the exact failure this is meant to prevent.
     value_type: Mapped[str] = mapped_column(
-        SAEnum(
-            "int", "decimal", "bool", "string",
+        ENUM(
+            "int",
+            "decimal",
+            "bool",
+            "string",
             name="parameter_value_type",
-            native_enum=True,
             create_type=False,  # the migration owns creation
         ),
         nullable=False,
@@ -755,15 +825,20 @@ class ParameterModel(Base):
 uv run alembic init -t async src/database/migrations
 ```
 
-Edit `alembic.ini` — set the script location and remove the hardcoded URL:
+Edit `alembic.ini` **in place**. Change only these two keys inside the
+existing `[alembic]` section, and delete the `sqlalchemy.url` line —
+`env.py` supplies the URL:
 
 ```ini
-[alembic]
 script_location = src/database/migrations
 prepend_sys_path = .
 ```
 
-Delete the `sqlalchemy.url` line entirely; `env.py` supplies it.
+> **Do not replace the file with the block above.** `alembic init` also
+> generates `[loggers]`, `[handlers]`, and `[formatters]` sections, and
+> `env.py` calls `fileConfig()` unconditionally. Dropping them makes every
+> `alembic` command — including CI's migrate step — die with
+> `KeyError: 'formatters'`.
 
 Replace `src/database/migrations/env.py`:
 
@@ -784,17 +859,26 @@ from src.database.base import Base
 import src.parameters.persistence.models  # noqa: F401
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 
+# The URL is passed straight to the engine, NEVER through
+# config.set_main_option(). That writes into ConfigParser, which performs
+# `%` interpolation — so a Supabase password containing a percent-encoded
+# character (`%40` for @, `%2F` for /) raises
+# `ValueError: invalid interpolation syntax`. Local creds like `pikol:pikol`
+# never trigger it, so this would pass in dev and in CI and then break the
+# first production migration — the exact laptop-against-.env.supabase.prod
+# flow spec §9.4 prescribes.
+DATABASE_URL = get_settings().database_url
+
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=config.get_main_option("sqlalchemy.url"),
+        url=DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
     )
@@ -813,6 +897,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        url=DATABASE_URL,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
@@ -875,7 +960,10 @@ SEED = [
 # while building the table and the migration fails with "type already
 # exists". Every enum in this project follows this shape.
 parameter_value_type = postgresql.ENUM(
-    "int", "decimal", "bool", "string",
+    "int",
+    "decimal",
+    "bool",
+    "string",
     name="parameter_value_type",
     create_type=False,
 )
@@ -1064,7 +1152,16 @@ class Parameters(BaseModel):
     money.
     """
 
-    model_config = {"extra": "forbid"}
+    # "ignore", NOT "forbid". The Global Constraint mandating extra="forbid"
+    # is about REQUEST schemas — untrusted input, where an unexpected field
+    # is an attack surface. Here the input is our own table, and forbidding
+    # extras inverts the compatibility it is meant to buy: the normal
+    # migrate-then-deploy order means a new parameter row exists while the
+    # previous release is still serving, and "forbid" would make every
+    # booking 500 until the deploy lands. Missing keys still raise, because
+    # every field below is required — which is the check that actually
+    # matters.
+    model_config = {"extra": "ignore"}
 
     default_slot_price_centavos: int = Field(ge=0)
     convenience_fee_percent: Decimal = Field(ge=0, le=100)
@@ -1223,8 +1320,8 @@ parameter_service = ParameterService()
 
 - [ ] **Step 8: Run the full suite to verify it passes**
 
-Run: `uv run pytest -v`
-Expected: PASS — 11 passed
+Run: `uv run ruff format . && uv run pytest -v`
+Expected: PASS — 15 passed
 
 - [ ] **Step 9: Commit**
 
@@ -1447,6 +1544,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 import json
 import logging
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 from src.utils.request_id import request_id_var
@@ -1461,6 +1559,11 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
+            # Without this, a line grepped out of Render's viewer and pasted
+            # into a ticket loses all timing — you cannot tell whether the 409
+            # preceded the webhook, or line anything up against PayMongo's
+            # timestamps during a payment dispute.
+            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -1489,10 +1592,16 @@ def configure_logging(debug: bool) -> None:
 `src/utils/errors.py`:
 
 ```python
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
+
+logger = logging.getLogger("pikol.error")
+
+SLOT_CONSTRAINT = "uq_court_slot_active"
 
 
 class ErrorResponse(BaseModel):
@@ -1500,18 +1609,44 @@ class ErrorResponse(BaseModel):
     request_id: str
 
 
+def _envelope(request: Request, status: int, detail: str) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", "")
+    return JSONResponse(
+        status_code=status,
+        content=ErrorResponse(detail=detail, request_id=request_id).model_dump(),
+        headers={"X-Request-ID": request_id},
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(IntegrityError)
     async def handle_integrity_error(request: Request, exc: IntegrityError) -> JSONResponse:
-        """A unique-constraint violation is the *expected* outcome when two
-        players race for one slot (spec §4.1) — a 409, not a 500."""
-        return JSONResponse(
-            status_code=409,
-            content=ErrorResponse(
-                detail="That slot is no longer available.",
-                request_id=getattr(request.state, "request_id", ""),
-            ).model_dump(),
-        )
+        """ONLY the slot-uniqueness violation is a 409.
+
+        Two players racing for one slot is the expected outcome of §4.1 and
+        deserves a 409. Every OTHER integrity error is a bug: a missing NOT
+        NULL column, an FK violation, a duplicate email on registration.
+        Dressing those as "That slot is no longer available" lies to the
+        caller on a request that has nothing to do with slots, tells them to
+        retry something that can never succeed, and hides a genuine fault
+        from 5xx alerting.
+        """
+        cause = getattr(exc.orig, "__cause__", None)
+        if getattr(cause, "constraint_name", None) == SLOT_CONSTRAINT:
+            return _envelope(request, 409, "That slot is no longer available.")
+
+        logger.exception("unhandled integrity error")
+        return _envelope(request, 500, "Internal server error.")
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        """Without this, an unhandled exception escapes to Starlette's
+        ServerErrorMiddleware, which emits a bare 500 carrying NO
+        X-Request-ID — so the one class of response where a support engineer
+        most needs the correlation ID is the only class that lacks it.
+        """
+        logger.exception("unhandled exception")
+        return _envelope(request, 500, "Internal server error.")
 ```
 
 - [ ] **Step 5: Implement pagination**
@@ -1591,9 +1726,15 @@ from src.utils.log import configure_logging
 from src.utils.request_id import RequestIDMiddleware
 
 
+# Configured once at import, NOT inside create_app. configure_logging
+# replaces the root handler list, and the `client` fixture builds an app per
+# test — reconfiguring mid-session destroys pytest's caplog handler and drops
+# any handler an operator attached.
+configure_logging(get_settings().debug)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    configure_logging(settings.debug)
 
     # OpenAPI lists every admin route and its request shape, so it is off
     # outside development — the same call asima makes.
@@ -1625,10 +1766,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 app = create_app()
 ```
 
+> **Run uvicorn with `--no-access-log`.** Its access logger sets
+> `propagate = False` and keeps its own plain-text formatter, so leaving it on
+> means every request is logged twice — once as JSON by the middleware, once
+> as plain text by uvicorn — and the JSON-lines format stops being greppable.
+
 - [ ] **Step 8: Run the full suite**
 
-Run: `uv run pytest -v`
-Expected: PASS — 22 passed
+Run: `uv run ruff format . && uv run pytest -v`
+Expected: PASS — 27 passed
 
 - [ ] **Step 9: Commit**
 
@@ -1756,7 +1902,7 @@ cp .env.example .env
 docker compose up -d
 uv sync
 uv run alembic upgrade head
-uv run uvicorn src.main:app --reload
+uv run uvicorn src.main:app --reload --no-access-log
 ```
 
 API docs at http://localhost:8000/docs, health at
@@ -1789,9 +1935,11 @@ any session working under this directory. Without it the Global Constraints
 live only in a plan nobody re-reads, and the first convention to be broken is
 usually snake_case at the wire boundary.
 
-`CLAUDE.md`:
+`CLAUDE.md` (four-backtick fence — the block contains a ```` ```bash ````
+fence of its own, and a three-backtick outer fence would be closed by it,
+swallowing the next step):
 
-```markdown
+````markdown
 # pikol-backend
 
 FastAPI + SQLAlchemy 2.0 (async) + Postgres. The court booking API for Pikol.
@@ -1833,10 +1981,10 @@ not conflate them.
 ```bash
 docker compose up -d                       # local Postgres
 uv run alembic upgrade head
-uv run uvicorn src.main:app --reload
+uv run uvicorn src.main:app --reload --no-access-log
 uv run ruff check . && uv run mypy src && uv run pytest
 ```
-```
+````
 
 - [ ] **Step 5: Commit and confirm CI is green**
 
