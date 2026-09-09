@@ -65,6 +65,8 @@ decision closed off an obvious alternative, the reason is recorded.
 | 21 | Players **verify email at signup**; staff are **invited** | Manager may create `VENUE_STAFF` only |
 | 22 | Staff may create closures and cancel bookings | With `cancelled_by_user_id` + required reason |
 | 23 | Availability grid: **time vertical, courts horizontal** | One component for players and staff |
+| 24 | Slots are **fixed at one hour**; no `slot_minutes` column | Rejected as speculative — it contradicted the on-the-hour `CHECK` |
+| 25 | All day boundaries are **Manila-local**, not UTC | §4; otherwise the 12am slot lands on the wrong day |
 
 ### 2.1 Why PayMongo and not Stripe
 
@@ -93,8 +95,11 @@ constraint, a timeline UI instead of a grid, and they create dead 30-minute
 gaps nobody books. Fixed slots make availability a lookup and double-booking a
 unique-index violation. Pickleball courts are sold in whole blocks anyway.
 
-`courts.slot_minutes` exists from day one (default 60), so per-venue slot
-lengths later are a config change rather than a migration and a rewrite.
+A configurable `slot_minutes` column was considered and rejected: it would
+contradict the on-the-hour `CHECK` (a 90-minute court needs slots at 01:30),
+and nothing asks for it. Variable slot length is a migration on the day a
+venue requests it — which is the honest price, rather than carrying a column
+that quietly cannot work.
 
 ---
 
@@ -190,20 +195,21 @@ and approval chains. A `Venue { id, name, address }` does not.
 parameters      key PK, value, value_type, description, updated_at, updated_by
 roles           id, code, name
 permissions     id, code                       -- RESOURCE:Action
-users           id, email, password_hash?, full_name, mobile,
+users           id, email UNIQUE, password_hash?, full_name, mobile,
                 role_id, venue_id?, is_active, email_verified_at?
 user_tokens     id, user_id, purpose, token_hash, expires_at, used_at?
                 -- purpose: EMAIL_VERIFICATION | PASSWORD_RESET | INVITATION
 venues          id, name, address, is_active
-courts          id, venue_id, name, slot_minutes=60, is_active
+courts          id, venue_id, name, is_active
 price_rules     id, court_id, day_of_week?, hour_of_day?, price_centavos
+                -- UNIQUE (court_id, day_of_week, hour_of_day) NULLS NOT DISTINCT
 booking_groups  id, court_id, player_id?, type, booking_status, payment_status,
                 -- type: PLAYER_BOOKING | WALK_IN | MAINTENANCE
                 price_centavos, fee_centavos, total_centavos, payment_method,
                 expires_at?, created_by_user_id, cancelled_at?,
                 cancelled_by_user_id?, cancellation_reason?,
                 needs_resolution=false, notes?
-booking_slots   id, booking_group_id, court_id, starts_at, ends_at,
+booking_slots   id, booking_group_id, court_id, starts_at,
                 price_centavos, booking_status
 payments        id, booking_group_id, provider, provider_checkout_id,
                 provider_payment_id?, amount_centavos, status, raw_payload
@@ -212,6 +218,23 @@ webhook_events  id, provider, provider_event_id UNIQUE, payload, processed_at?
 
 Money is **integer centavos**, never float. Times are `timestamptz` stored
 UTC, rendered Asia/Manila (PH has no DST, so the offset is a fixed +08).
+
+**Every slot is exactly one hour.** `ends_at` is therefore derived
+(`starts_at + 1 hour`), never stored — a stored copy only creates drift. A
+configurable slot length was considered and **rejected**: it contradicts the
+on-the-hour `CHECK` below (a 90-minute court needs slots at 01:30), and no
+requirement asks for it. When a venue actually does, it is a migration.
+
+**Dates are Manila-local, always.** This is not a rendering concern — it
+changes query boundaries. Manila is UTC+8, so Manila's 15 September begins at
+`2026-09-14T16:00Z`. The obvious `WHERE starts_at::date = :date` returns the
+wrong 24 hours, and the slot it misplaces first is **12am–1am**, which lands
+on the previous day's grid. Every day-bounded query uses:
+
+```sql
+starts_at >= (:date::timestamp AT TIME ZONE 'Asia/Manila')
+AND starts_at <  ((:date::timestamp + interval '1 day') AT TIME ZONE 'Asia/Manila')
+```
 
 ### 4.1 The constraint that makes the system correct
 
@@ -258,6 +281,11 @@ A single repository method owns every status write and updates both tables
 together. No other code path may set a status. Anything that violates this
 corrupts availability itself, so it is worth a dedicated test.
 
+`court_id` is duplicated for the same reason and carries the same rule: the
+index needs it on `booking_slots`, and `booking_groups.court_id` is
+authoritative. It also makes explicit that **a group belongs to exactly one
+court** — booking two courts for the same hour is two groups and two payments.
+
 `expires_at` is **not** duplicated — it lives only on `booking_groups`, so
 expiry queries join.
 
@@ -294,9 +322,25 @@ Both tables move together, preserving the §4.2 invariant. Note that expiring a
 never paid for.
 
 A hold is therefore released the instant anyone tries to take the slot,
-whether or not any job ran. The availability *read* applies the same rule as a
-filter, so expired holds vanish from the grid immediately rather than 15
-minutes late.
+whether or not any job ran.
+
+**The consequence, and it is the sharpest trap in this design:** a lapsed hold
+on a slot *nobody contests* keeps its `PENDING` row indefinitely. Cleanup is
+lazy, so `booking_status = 'PENDING'` alone never means "currently holding".
+
+> **Every read of `PENDING` must apply `AND expires_at > now()`.** There are no
+> exceptions, and this is a required test.
+
+Two places depend on it, and the second one bites:
+
+- **Availability** — without the filter, abandoned holds block the grid for 15
+  minutes. Annoying, self-healing.
+- **The hold cap** — a naive `COUNT(*) WHERE player_id = ? AND
+  booking_status = 'PENDING'` counts holds that lapsed weeks ago. A player who
+  abandons checkout three times on unpopular slots is then **permanently
+  unable to book**, and nothing ever clears it. Abandoning checkout is the
+  common case, so this is a self-inflicted denial of service on paying
+  customers.
 
 **A scheduler is available and optional.** Supabase `pg_cron` runs on the free
 tier and works even while the API is asleep; GitHub Actions cron is the asima
@@ -337,8 +381,16 @@ already paid.
 | `max_active_holds_per_player` | `3` | denial-of-inventory cap |
 | `staff_backdate_days` | `7` | walk-in reconciliation window |
 | `cancellation_cutoff_minutes` | `0` | how close to start a player may cancel |
-| `default_slot_minutes` | `60` | slot length for new courts |
+| `min_lead_minutes` | `20` | earliest a player may book before a slot starts |
 | `invitation_expiry_days` | `7` | staff invitation token lifetime |
+| `webhook_payload_retention_days` | `90` | before raw provider payloads are purged |
+
+**`min_lead_minutes` must be ≥ `hold_duration_minutes`**, and validation
+enforces that when either is written. Otherwise a hold can outlive the slot it
+holds: a player books a slot starting in 5 minutes, pays at minute 12, and the
+webhook confirms a session that began 7 minutes ago. The "not past" check runs
+at hold creation and never again. **Walk-ins are exempt** — staff are booking
+someone standing at the counter.
 
 The PayMongo checkout session expiry is **derived**, not configured:
 `hold_duration_minutes − 3`. Deriving it guarantees the checkout can never
@@ -377,8 +429,12 @@ payment_status    UNPAID · PAID · FAILED
 - **Online:** `PENDING/UNPAID` → webhook → `CONFIRMED/PAID`
 - **Walk-in:** `CONFIRMED/UNPAID` → staff collects → `CONFIRMED/PAID`
 
+`booking_groups.payment_status` is **authoritative** — it is what guards read
+and what the UI shows. `payments.status` tracks one provider attempt, and a
+group may accumulate several rows when a player retries a failed checkout.
+
 `IN_PROGRESS` is **derived, never stored**: `CONFIRMED ∧ now ∈ [starts_at,
-ends_at)`. A stored value would be wrong between scheduler ticks — a 6:00pm
+starts_at + 1 hour)`. A stored value would be wrong between ticks — a 6:00pm
 booking under a 5-minute cron reads `CONFIRMED` until 6:05. Derived is exact
 at every read and cannot drift.
 
@@ -386,7 +442,7 @@ at every read and cannot drift.
 
 | From | To | Actor | Guard |
 |---|---|---|---|
-| — | `PENDING/UNPAID` | Player | Slots free, on the hour, within horizon, not past, < 3 active holds |
+| — | `PENDING/UNPAID` | Player | Slots free, on the hour, within horizon, ≥ `min_lead_minutes` away, < `max_active_holds_per_player` **unexpired** holds |
 | — | `CONFIRMED/UNPAID` | Staff | Slots free; may backdate ≤ `staff_backdate_days` |
 | `PENDING` | `CONFIRMED` | **Webhook only** | Signature verified, event not already processed |
 | `PENDING` | `EXPIRED` | System | `expires_at <= now()` |
@@ -404,8 +460,10 @@ Terminal: `COMPLETED`, `NO_SHOW`, `CANCELLED`, `EXPIRED`.
 
 1. Player selects a court, a date, and one or more **consecutive** hours.
 2. `POST /api/v1/bookings` → **one transaction**:
-   - validate slots are consecutive, on the hour, within horizon, not past
-   - check the player's active hold count against `max_active_holds_per_player`
+   - validate slots are consecutive, on the hour, within horizon, and at
+     least `min_lead_minutes` in the future
+   - count the player's **unexpired** holds — `booking_status = 'PENDING'
+     AND expires_at > now()` — against `max_active_holds_per_player`
    - resolve each slot's price through the rule chain; compute the fee
    - expire stale `PENDING` rows for those exact `(court, slot)` pairs
    - insert `booking_group` (`PENDING/UNPAID`, `expires_at = now + hold`)
@@ -484,7 +542,7 @@ temporary hack.
 
 | Layer | Enforces |
 |---|---|
-| **Database** | Slot uniqueness, on-the-hour `CHECK`, FK integrity, webhook event uniqueness, non-negative money |
+| **Database** | Slot uniqueness, on-the-hour `CHECK`, unique `users.email`, unique `price_rules` specificity (`NULLS NOT DISTINCT`, or every wildcard row is trivially unique and the constraint does nothing), FK integrity, webhook event uniqueness, non-negative money |
 | **Domain** (pure Python) | Every transition guard, price/fee computation, hold expiry, consecutive-slot validation — unit tested with no database |
 | **Service** | Transaction boundary, orchestration, external calls kept outside the transaction |
 | **Router + schema** | Shape validation, authentication, venue scoping |
@@ -648,9 +706,19 @@ GET /api/v1/availability?venue_id=1&date=2026-09-15
 
 One request returns the whole day grid — every court, 24 slots each, with
 per-slot `status` (`AVAILABLE` · `BOOKED` · `CLOSED` · `PAST`) and resolved
-`price_centavos`. A single query, with the hold-expiry rule applied as a
-filter so abandoned holds are already gone. The frontend renders it directly:
-no N+1 per court, no client-side price resolution.
+`price_centavos`. The frontend renders it directly: no N+1 per court, no
+client-side price resolution.
+
+Three things this endpoint must get right:
+
+- **`date` is Manila-local**, bounded as in §4 — otherwise the 12am–1am slot
+  appears on the wrong day.
+- **The hold-expiry filter applies** (§4.3), so abandoned holds are already
+  gone from the grid.
+- **Prices resolve in memory, not per cell.** A 6-court venue is 144 cells,
+  each needing the four-level fallback of §4.4. Load the venue's `price_rules`
+  once — tens of rows — and resolve against that set. Resolving per cell in
+  SQL is 144 round trips wearing a single endpoint's clothing.
 
 Slot `status` deliberately does **not** reveal *who* booked a slot. That
 distinction is what lets any authenticated player read the grid while booking
@@ -688,7 +756,19 @@ no URL at all.
 paid-but-unhousable cases a human must settle. Small endpoint, but without it
 those failures stay invisible until a customer complains.
 
-### 7.5 The webhook route needs three exemptions
+### 7.5 Raw provider payloads are personal data
+
+`webhook_events.payload` and `payments.raw_payload` hold PayMongo's raw
+payloads, which carry payer name, email, and mobile. They are kept because
+disputes and webhook debugging need the original bytes, but they are personal
+data under the Data Privacy Act (RA 10173) and must not accumulate forever.
+
+- Purge after `webhook_payload_retention_days` (default 90). This is exactly
+  the hygiene job `pg_cron` exists for (§4.3).
+- **Payloads are never written to application logs.** Log the
+  `provider_event_id` and the outcome; the payload stays in the table.
+
+### 7.6 The webhook route needs three exemptions
 
 Each is easy to miss and each breaks delivery silently:
 
