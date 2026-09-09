@@ -1,0 +1,359 @@
+// ============================================================================
+// Pikol — Pickleball Court Booking System
+// ERD for docs/plans/2026-09-09-court-booking-system-design.md
+//
+// Paste into https://dbdiagram.io to render.
+//
+// ⚠️  THIS FILE IS A PICTURE, NOT THE SOURCE OF TRUTH.
+//
+// Alembic migrations are authoritative. DBML cannot express the two
+// constraints that make this system correct:
+//
+//   1. booking_slots' unique index is PARTIAL — it excludes CANCELLED and
+//      EXPIRED rows. DBML has no WHERE clause, so the index below reads as a
+//      plain unique constraint. Generating DDL from this file would forbid
+//      ever rebooking a cancelled slot.
+//   2. price_rules' unique constraint needs NULLS NOT DISTINCT. Without it,
+//      every wildcard row is trivially unique and the constraint does nothing.
+//
+// Both are called out at their tables. Write them by hand in the migration.
+// ============================================================================
+
+// ─────────────────────────── Enums ───────────────────────────
+
+Enum booking_type {
+  PLAYER_BOOKING [note: 'Booked online by a registered player']
+  WALK_IN        [note: 'Entered by staff at the counter']
+  MAINTENANCE    [note: 'A closure. Same table so ONE index blocks every collision']
+}
+
+Enum booking_status {
+  PENDING   [note: 'Hold. Blocks the slot, expires. Never means "held" without expires_at > now()']
+  CONFIRMED
+  COMPLETED [note: 'Set by staff after play']
+  NO_SHOW   [note: 'Set by staff after play']
+  CANCELLED [note: 'Releases the slot']
+  EXPIRED   [note: 'Releases the slot']
+  // IN_PROGRESS is NOT here — it is derived at read time:
+  // CONFIRMED AND now() IN [starts_at, starts_at + 1 hour)
+}
+
+Enum payment_status {
+  UNPAID
+  PAID
+  FAILED
+}
+
+Enum payment_method {
+  PAYMONGO     [note: 'Online. Player pays the convenience fee']
+  CASH         [note: 'Walk-in at the counter. No fee']
+  MANUAL_GCASH [note: 'Scanned the venue QR. PayMongo never sees it. No fee']
+}
+
+Enum token_purpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  INVITATION
+}
+
+Enum payment_provider {
+  MOCK
+  PAYMONGO
+}
+
+Enum provider_payment_status {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+}
+
+Enum parameter_value_type {
+  int
+  decimal
+  bool
+  string
+}
+
+// ─────────────────────── Identity & access ───────────────────────
+
+Table roles {
+  id   integer     [pk, increment]
+  code varchar(32) [not null, unique, note: 'SUPER_ADMIN | VENUE_MANAGER | VENUE_STAFF | PLAYER']
+  name varchar(64) [not null]
+}
+
+Table permissions {
+  id   integer     [pk, increment]
+  code varchar(64) [not null, unique, note: 'RESOURCE:Action — e.g. COURT:Manage']
+}
+
+Table role_permissions {
+  role_id       integer [not null]
+  permission_id integer [not null]
+
+  indexes {
+    (role_id, permission_id) [pk]
+  }
+  Note: 'SUPER_ADMIN is an unconditional bypass axis and does not depend on rows here.'
+}
+
+Table users {
+  id                integer      [pk, increment]
+  email             varchar(255) [not null, unique]
+  password_hash     varchar(255) [null, note: 'NULL until an invited staff member sets their own. The manager never knows it']
+  full_name         varchar(128) [not null]
+  mobile            varchar(32)
+  role_id           integer      [not null]
+  venue_id          integer      [null, note: 'NULL for SUPER_ADMIN and PLAYER. The whole basis of VenueScope']
+  is_active         boolean      [not null, default: false]
+  email_verified_at timestamptz  [null, note: 'Players must verify to complete signup']
+  created_at        timestamptz  [not null, default: `now()`]
+
+  Note: '''
+  A player is simply role = PLAYER, not a separate identity system.
+
+  On the manager-facing create endpoint, role_id is FIXED to VENUE_STAFF and
+  venue_id comes from the CREATOR TOKEN, never the request body. Taking either
+  from input lets a manager mint a SUPER_ADMIN, or issue themselves a valid
+  credential at another venue that passes every VenueScope check.
+  '''
+}
+
+Table user_tokens {
+  id         integer     [pk, increment]
+  user_id    integer     [not null]
+  purpose    token_purpose [not null]
+  token_hash varchar(255)  [not null, note: 'Hashed at rest. The raw token exists only in the email']
+  expires_at timestamptz   [not null]
+  used_at    timestamptz   [null, note: 'Single use']
+  created_at timestamptz   [not null, default: `now()`]
+
+  indexes {
+    (user_id, purpose)
+    token_hash [unique]
+  }
+}
+
+// ─────────────────────────── Inventory ───────────────────────────
+
+Table venues {
+  id        integer      [pk, increment]
+  name      varchar(128) [not null]
+  address   text
+  is_active boolean      [not null, default: true]
+}
+
+Table courts {
+  id        integer      [pk, increment]
+  venue_id  integer      [not null]
+  name      varchar(64)  [not null]
+  is_active boolean      [not null, default: true]
+
+  Note: '''
+  No price column — pricing lives entirely in price_rules over a parameters
+  fallback.
+
+  No slot_minutes column either. It was considered and rejected: every slot is
+  exactly one hour, and a configurable length would contradict the
+  on-the-hour CHECK (a 90-minute court needs slots at 01:30). Variable slot
+  length is a migration on the day a venue asks for it.
+  '''
+}
+
+Table price_rules {
+  id             integer [pk, increment]
+  court_id       integer [not null]
+  day_of_week    integer [null, note: 'NULL = any day. 0=Sunday .. 6=Saturday']
+  hour_of_day    integer [null, note: 'NULL = any hour. 0..23']
+  price_centavos integer [not null]
+
+  indexes {
+    (court_id, day_of_week, hour_of_day) [unique, name: 'uq_price_rule_specificity']
+  }
+
+  Note: '''
+  NULLs are WILDCARDS, which is how a court gets its own flat price without
+  24 rows:
+
+    (NULL, NULL) → flat rate, any time      (NULL, 18) → 6pm daily
+    (6, NULL)    → all Saturday             (6, 18)    → Saturday 6pm
+
+  Resolution is most-specific-wins, then the parameter:
+    (day,hour) → (hour) → (day) → (NULL,NULL) → parameters.default_slot_price_centavos
+
+  ⚠️  The unique index above MUST be declared NULLS NOT DISTINCT in the
+  migration. Postgres treats NULLs as distinct by default, so without it every
+  wildcard row is trivially unique, the constraint does nothing, and two
+  equally-specific rules resolve by arbitrary row order.
+  '''
+}
+
+// ──────────────────────────── Booking ────────────────────────────
+
+Table booking_groups {
+  id                   integer        [pk, increment]
+  court_id             integer        [not null, note: 'Authoritative. A group is exactly ONE court']
+  player_id            integer        [null, note: 'NULL for WALK_IN and MAINTENANCE']
+  type                 booking_type   [not null]
+  booking_status       booking_status [not null]
+  payment_status       payment_status [not null, note: 'AUTHORITATIVE over payments.status']
+  price_centavos       integer        [not null, note: 'Frozen at creation. A later price change must not alter what was paid']
+  fee_centavos         integer        [not null, default: 0, note: 'Frozen at creation. 0 for walk-ins']
+  total_centavos       integer        [not null]
+  payment_method       payment_method [null]
+  expires_at           timestamptz    [null, note: 'Hold deadline. PENDING only']
+  needs_resolution     boolean        [not null, default: false, note: 'Paid but unhousable — admin queue']
+  created_by_user_id   integer        [not null]
+  cancelled_at         timestamptz    [null]
+  cancelled_by_user_id integer        [null]
+  cancellation_reason  text           [null, note: 'REQUIRED when cancelling. No refunds, so this is the audit trail']
+  notes                text
+  created_at           timestamptz    [not null, default: `now()`]
+
+  indexes {
+    (player_id, booking_status)
+    (court_id, booking_status)
+    needs_resolution
+  }
+
+  Note: '''
+  A multi-hour session is ONE group with N slots — one payment, one
+  cancellation unit. Booking two courts for the same hour is two groups.
+
+  Online:  PENDING/UNPAID   → webhook → CONFIRMED/PAID
+  Walk-in: CONFIRMED/UNPAID → staff   → CONFIRMED/PAID
+
+  Two axes because a staff-created walk-in must block its slot BEFORE money
+  changes hands. One status column cannot express that.
+
+  needs_resolution is a FLAG, not a status: the booking genuinely is
+  EXPIRED/PAID, and inventing a status would force every state-machine guard
+  to handle a value that is not a state.
+  '''
+}
+
+Table booking_slots {
+  id               integer        [pk, increment]
+  booking_group_id integer        [not null]
+  court_id         integer        [not null, note: 'Mirrors the group. Duplicated because the index needs it here']
+  starts_at        timestamptz    [not null, note: 'CHECK EXTRACT(MINUTE FROM starts_at) = 0']
+  price_centavos   integer        [not null]
+  booking_status   booking_status [not null, note: 'Mirrors the group. Written in the SAME transaction, never independently']
+
+  indexes {
+    (court_id, starts_at) [unique, name: 'uq_court_slot_active']
+    booking_group_id
+  }
+
+  Note: '''
+  ⚠️  uq_court_slot_active IS PARTIAL. The real definition is:
+
+      CREATE UNIQUE INDEX uq_court_slot_active ON booking_slots (court_id, starts_at)
+       WHERE booking_status NOT IN ('CANCELLED', 'EXPIRED');
+
+  DBML has no WHERE clause, so it renders above as a plain unique constraint.
+  Generating DDL from this file would forbid ever rebooking a cancelled slot.
+
+  That one predicate makes EVERY collision impossible at the database level —
+  online vs online, online vs walk-in, and booking vs maintenance — with no
+  application locking and no read-then-write race. The loser of a race gets an
+  IntegrityError, which the router turns into 409.
+
+  It is inverted deliberately (NOT IN cancelled/expired, rather than IN
+  pending/confirmed) so COMPLETED and NO_SHOW still hold their slots —
+  otherwise staff backdating a walk-in could collide with a finished booking.
+
+  No ends_at: every slot is exactly one hour, so it is derived. A stored copy
+  only creates drift.
+
+  booking_status is denormalized here because a Postgres index predicate
+  cannot reference another table. booking_groups stays authoritative, and a
+  SINGLE repository method owns every status write, updating both tables
+  together. Violating that corrupts availability itself.
+  '''
+}
+
+// ──────────────────────────── Payments ────────────────────────────
+
+Table payments {
+  id                   integer                 [pk, increment]
+  booking_group_id     integer                 [not null]
+  provider             payment_provider        [not null]
+  provider_checkout_id varchar(128)            [not null]
+  provider_payment_id  varchar(128)            [null]
+  amount_centavos      integer                 [not null]
+  status               provider_payment_status [not null]
+  raw_payload          jsonb                   [null, note: '⚠️ PII. Purged after webhook_payload_retention_days. Never logged']
+  created_at           timestamptz             [not null, default: `now()`]
+
+  indexes {
+    booking_group_id
+    provider_checkout_id [unique]
+  }
+  Note: 'One row per provider ATTEMPT — a group accumulates several when a player retries a failed checkout. booking_groups.payment_status is authoritative.'
+}
+
+Table webhook_events {
+  id                integer          [pk, increment]
+  provider          payment_provider [not null]
+  provider_event_id varchar(128)     [not null, unique]
+  payload           jsonb            [not null, note: '⚠️ PII. Purged after webhook_payload_retention_days. Never logged']
+  processed_at      timestamptz      [null]
+  received_at       timestamptz      [not null, default: `now()`]
+
+  Note: '''
+  Idempotency comes from the UNIQUE on provider_event_id, not from code: the
+  handler INSERTS FIRST, and a unique violation *is* the "already processed"
+  check. No if-already-handled branch to get wrong, and no race between two
+  concurrent redeliveries. PayMongo retries, and retries must be free.
+  '''
+}
+
+// ─────────────────────────── Configuration ───────────────────────────
+
+Table parameters {
+  key                varchar(64)         [pk]
+  value              text                [not null, note: 'Stored as text; Pydantic coerces and validates on load']
+  value_type         parameter_value_type [not null, note: 'For rendering the admin input, not for coercion']
+  description        text                [not null]
+  updated_at         timestamptz         [not null, default: `now()`]
+  updated_by_user_id integer             [null]
+
+  Note: '''
+  Business rules, tunable without a deploy — distinct from environment config.
+  Admin-only writes; updated_by_user_id is the audit trail on numbers that
+  move money.
+
+  Seeded keys: default_slot_price_centavos, convenience_fee_percent,
+  hold_duration_minutes, booking_horizon_days, max_active_holds_per_player,
+  staff_backdate_days, cancellation_cutoff_minutes, min_lead_minutes,
+  invitation_expiry_days, webhook_payload_retention_days.
+
+  min_lead_minutes MUST be >= hold_duration_minutes, enforced by a
+  cross-field validator. Below that, a hold outlives the slot it holds and the
+  webhook confirms a session that already started.
+  '''
+}
+
+// ────────────────────────── Relationships ──────────────────────────
+
+Ref: users.role_id > roles.id
+Ref: users.venue_id > venues.id
+Ref: role_permissions.role_id > roles.id
+Ref: role_permissions.permission_id > permissions.id
+Ref: user_tokens.user_id > users.id [delete: cascade]
+
+Ref: courts.venue_id > venues.id
+Ref: price_rules.court_id > courts.id [delete: cascade]
+
+Ref: booking_groups.court_id > courts.id
+Ref: booking_groups.player_id > users.id
+Ref: booking_groups.created_by_user_id > users.id
+Ref: booking_groups.cancelled_by_user_id > users.id
+
+Ref: booking_slots.booking_group_id > booking_groups.id [delete: cascade]
+Ref: booking_slots.court_id > courts.id
+
+Ref: payments.booking_group_id > booking_groups.id
+Ref: parameters.updated_by_user_id > users.id
