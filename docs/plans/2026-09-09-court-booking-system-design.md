@@ -1,8 +1,8 @@
 # Pikol — Pickleball Court Booking System — Design
 
 **Date:** 2026-09-09
-**Status:** 🚧 In progress — Sections 1–3 designed and approved. API surface,
-frontend, and deployment pending.
+**Status:** 🚧 In progress — product, data model, booking lifecycle, auth, and
+API surface designed and approved. Frontend and deployment pending.
 **Scope:** Full system design for a single-owner, multi-venue pickleball court
 booking platform with online payments, ahead of any implementation.
 
@@ -46,7 +46,7 @@ decision closed off an obvious alternative, the reason is recorded.
 | 3 | **Clock-aligned hourly slots** | Not arbitrary ranges — see §2.2 |
 | 4 | **24/7 bookable**; closures are the exception | No operating-hours config in v1 |
 | 5 | **Maintenance closure is a booking row** | Gives one race-proof constraint for all collisions |
-| 6 | Players **must register** to book | No guest checkout |
+| 6 | Players **must register and log in** to use the app at all | No guest checkout, no anonymous browsing |
 | 7 | Staff book walk-ins; **same aggregate**, cash/manual-GCash payment | No parallel flow |
 | 8 | **Hold-then-confirm**, 15-min expiry | Full payment online |
 | 9 | **No refunds**; cancellation returns the slot to inventory | Player may still cancel; they just aren't repaid |
@@ -574,13 +574,86 @@ never got the email" report, and keep the resend action obvious in the UI.
 
 ---
 
-## 7. Still to design
+## 7. API surface
 
-- **Section 4** — API surface, endpoint by endpoint
-- **Section 5** — Frontend: public booking surface + staff console, feature slices
-- **Section 6** — Deployment: Vercel + Render + Supabase, environments, CI
+### 7.1 Authentication is required everywhere
 
-## 8. Open questions
+Only the auth endpoints themselves and the payment webhook are reachable
+without a valid token. The venue list, the court list, and the availability
+grid are **not public** — a visitor registers, verifies, and logs in before
+seeing any inventory.
+
+This has one business consequence worth stating rather than discovering: the
+app has no publicly crawlable pages, so it contributes nothing to organic
+discovery. If that matters later, a separate marketing site can link into the
+login page without any change to this design.
+
+### 7.2 The endpoint that matters most
+
+```
+GET /api/v1/availability?venue_id=1&date=2026-09-15
+```
+
+One request returns the whole day grid — every court, 24 slots each, with
+per-slot `status` (`AVAILABLE` · `BOOKED` · `CLOSED` · `PAST`) and resolved
+`price_centavos`. A single query, with the hold-expiry rule applied as a
+filter so abandoned holds are already gone. The frontend renders it directly:
+no N+1 per court, no client-side price resolution.
+
+Slot `status` deliberately does **not** reveal *who* booked a slot. That
+distinction is what lets any authenticated player read the grid while booking
+identities stay on the staff endpoints.
+
+### 7.3 Transitions are actions, not PATCHes
+
+```
+POST /api/v1/admin/bookings/{id}/cancel      { reason }
+POST /api/v1/admin/bookings/{id}/mark-paid   { payment_method }
+POST /api/v1/admin/bookings/{id}/outcome     { outcome: COMPLETED | NO_SHOW }
+```
+
+Not `PATCH /bookings/{id} { status: "COMPLETED" }`. A generic status patch
+invites every transition and pushes the guards into a `match` statement
+someone will eventually extend wrongly. A named action route carries one
+guard, one permission, and one audit record — and the illegal transitions have
+no URL at all.
+
+### 7.4 Endpoint map
+
+| Group | Endpoints |
+|---|---|
+| **Auth** (unauthenticated) | `register` (players only) · `login` · `refresh` · `logout` · `verify-email` (+ `/resend`) · `invitations/accept` · `password/forgot` · `password/reset` |
+| **Self** | `GET/PATCH /users/me` · `PATCH /users/me/password` · `GET /users/me/permissions` |
+| **Catalog** | `GET /venues` · `GET /venues/{id}/courts` · `GET /availability` |
+| **Player bookings** | `POST /bookings` (hold + checkout) · `GET /bookings/me` · `GET /bookings/me/{id}` · `POST /bookings/me/{id}/cancel` |
+| **Admin — setup** | `venues` · `courts` · `courts/{id}/price-rules` · `closures` (bulk range → N slot rows) · `parameters` |
+| **Admin — ops** | `GET /admin/bookings` (venue/court/date/status filters) · `POST /admin/bookings/walk-in` · the three action routes above · `GET /admin/bookings/unfulfilled` |
+| **Admin — staff** | `POST /admin/users` (invite) · `GET /admin/users` · `PATCH /admin/users/{id}` |
+| **Webhook** (unauthenticated) | `POST /webhooks/paymongo` |
+| **Health** | `GET /health` |
+
+`GET /admin/bookings/unfulfilled` is the resolution queue from §5.5 — the
+paid-but-unhousable cases a human must settle. Small endpoint, but without it
+those failures stay invisible until a customer complains.
+
+### 7.5 The webhook route needs three exemptions
+
+Each is easy to miss and each breaks delivery silently:
+
+- **No JWT requirement** — PayMongo has no token.
+- **No rate limiting** — a retry storm during an incident is exactly when
+  delivery matters most, and a 429 would make it permanent.
+- **Raw request body preserved** for signature verification. Any middleware
+  that parses and re-serializes JSON invalidates the signature.
+
+---
+
+## 8. Still to design
+
+- **Frontend**: public booking surface + staff console, feature slices
+- **Deployment**: Vercel + Render + Supabase, environments, CI
+
+## 9. Open questions
 
 - **BIR official receipts.** PH businesses are legally required to issue them.
   Assumed handled outside this system — recorded as a decision, not a surprise.
