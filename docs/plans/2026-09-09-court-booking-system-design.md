@@ -1,8 +1,8 @@
 # Pikol — Pickleball Court Booking System — Design
 
 **Date:** 2026-09-09
-**Status:** 🚧 In progress — product, data model, booking lifecycle, auth, API
-surface, and frontend designed and approved. Deployment pending.
+**Status:** ✅ Design complete and approved across all sections. Ready for an
+implementation plan. No application code exists yet.
 **Scope:** Full system design for a single-owner, multi-venue pickleball court
 booking platform with online payments, ahead of any implementation.
 
@@ -29,8 +29,9 @@ Scoping is a single nullable `users.venue_id` column — a manager runs exactly
 one venue, so a join table would be unused ceremony. `NULL` for admin and
 players.
 
-Self-registration is **players only**. Staff accounts are created by the
-admin, so registration can never become a privilege-escalation path.
+Self-registration is **players only**. Staff accounts are created by an admin
+or by their own venue's manager (§6.4), so registration can never become a
+privilege-escalation path.
 
 ---
 
@@ -60,7 +61,10 @@ decision closed off an obvious alternative, the reason is recorded.
 | 17 | Staff set `COMPLETED` / `NO_SHOW`; **`IN_PROGRESS` is derived** | |
 | 18 | **Mock payment provider first** → PayMongo test → live | Validates the port/adapter boundary |
 | 19 | **Three repos**, asima-style | parent + backend + frontend |
-| 20 | All free tiers; cold starts accepted | |
+| 20 | All free tiers; cold starts accepted | Keep-alive is load-bearing, see §9.3 |
+| 21 | Players **verify email at signup**; staff are **invited** | Manager may create `VENUE_STAFF` only |
+| 22 | Staff may create closures and cancel bookings | With `cancelled_by_user_id` + required reason |
+| 23 | Availability grid: **time vertical, courts horizontal** | One component for players and staff |
 
 ### 2.1 Why PayMongo and not Stripe
 
@@ -194,9 +198,11 @@ venues          id, name, address, is_active
 courts          id, venue_id, name, slot_minutes=60, is_active
 price_rules     id, court_id, day_of_week?, hour_of_day?, price_centavos
 booking_groups  id, court_id, player_id?, type, booking_status, payment_status,
+                -- type: PLAYER_BOOKING | WALK_IN | MAINTENANCE
                 price_centavos, fee_centavos, total_centavos, payment_method,
                 expires_at?, created_by_user_id, cancelled_at?,
-                cancelled_by_user_id?, cancellation_reason?, notes?
+                cancelled_by_user_id?, cancellation_reason?,
+                needs_resolution=false, notes?
 booking_slots   id, booking_group_id, court_id, starts_at, ends_at,
                 price_centavos, booking_status
 payments        id, booking_group_id, provider, provider_checkout_id,
@@ -235,19 +241,57 @@ already-completed booking.
 
 Cost: closing a court for a week writes 168 rows. Postgres does not care.
 
-### 4.2 Expiring holds without depending on a scheduler
+### 4.2 Status is denormalized onto slots — deliberately
 
-An index predicate cannot reference `now()` — Postgres requires immutable
-predicates — so an abandoned `PENDING` row would otherwise block its slot
-forever. The fix is that **the write path cleans up exactly the row it needs**,
-inside the same transaction:
+`booking_slots` carries its own `booking_status`, duplicating the group's. That
+is not an oversight: the partial unique index in §4.1 must live on
+`booking_slots`, and a Postgres index predicate **cannot reference another
+table**. Uniqueness therefore requires the status to sit on the row it
+protects.
+
+The invariant this creates must be honoured everywhere:
+
+> **`booking_slots.booking_status` always mirrors its group, written in the
+> same transaction, never independently. `booking_groups` is authoritative.**
+
+A single repository method owns every status write and updates both tables
+together. No other code path may set a status. Anything that violates this
+corrupts availability itself, so it is worth a dedicated test.
+
+`expires_at` is **not** duplicated — it lives only on `booking_groups`, so
+expiry queries join.
+
+### 4.3 Expiring holds without depending on a scheduler
+
+An index predicate cannot reference `now()` either — Postgres requires
+immutable predicates — so an abandoned `PENDING` row would otherwise block its
+slot forever. The fix is that **the write path cleans up exactly the rows it
+needs**, inside the same transaction, before inserting:
 
 ```sql
+-- 1. expire any group holding this slot whose hold has lapsed
+WITH lapsed AS (
+    SELECT g.id
+      FROM booking_groups g
+      JOIN booking_slots s ON s.booking_group_id = g.id
+     WHERE s.court_id = :court_id
+       AND s.starts_at = :starts_at
+       AND g.booking_status = 'PENDING'
+       AND g.expires_at <= now()
+), _g AS (
+    UPDATE booking_groups SET booking_status = 'EXPIRED'
+     WHERE id IN (SELECT id FROM lapsed)
+)
 UPDATE booking_slots SET booking_status = 'EXPIRED'
- WHERE court_id = :court_id AND starts_at = :starts_at
-   AND booking_status = 'PENDING' AND expires_at <= now();
--- then INSERT ...;  IntegrityError → 409
+ WHERE booking_group_id IN (SELECT id FROM lapsed);
+
+-- 2. then INSERT the new slots;  IntegrityError → 409
 ```
+
+Both tables move together, preserving the §4.2 invariant. Note that expiring a
+*group* releases **all** its slots, not only the contested one — a lapsed
+6–8pm hold frees both hours, which is correct: the group is the unit that was
+never paid for.
 
 A hold is therefore released the instant anyone tries to take the slot,
 whether or not any job ran. The availability *read* applies the same rule as a
@@ -259,7 +303,7 @@ tier and works even while the API is asleep; GitHub Actions cron is the asima
 pattern. Use it for hygiene — tidying expired rows for clean reporting, and
 later reminder emails — never for correctness.
 
-### 4.3 Pricing: wildcard rules over a parameter fallback
+### 4.4 Pricing: wildcard rules over a parameter fallback
 
 Courts hold **no price column**. A court's "own price" is a wildcard rule:
 
@@ -282,7 +326,7 @@ One code path covers per-court pricing and peak pricing.
 The owner raising the 6pm rate must not retroactively change what someone
 already paid.
 
-### 4.4 The `parameters` table
+### 4.5 The `parameters` table
 
 | key | default | governs |
 |---|---|---|
@@ -294,6 +338,11 @@ already paid.
 | `staff_backdate_days` | `7` | walk-in reconciliation window |
 | `cancellation_cutoff_minutes` | `0` | how close to start a player may cancel |
 | `default_slot_minutes` | `60` | slot length for new courts |
+| `invitation_expiry_days` | `7` | staff invitation token lifetime |
+
+The PayMongo checkout session expiry is **derived**, not configured:
+`hold_duration_minutes − 3`. Deriving it guarantees the checkout can never
+outlive the hold that backs it, which is the §5.5 hazard.
 
 Values load through a Pydantic model with a short TTL cache, so `"abc"` in
 `convenience_fee_percent` fails loudly at load rather than silently zeroing
@@ -400,8 +449,11 @@ Mitigations, in order:
    against 15) so payment cannot normally land after the hold dies.
 2. On a late `payment.paid`, **attempt to re-acquire the slots**. If they are
    still free, the booking is restored and nobody notices.
-3. If re-acquisition fails, mark the group `PAID_UNFULFILLED` and surface it
-   in an **admin resolution queue**.
+3. If re-acquisition fails, set `needs_resolution = true` and surface the
+   group in an **admin resolution queue**. This is deliberately a *flag*, not a
+   status: the booking genuinely is `EXPIRED`/`PAID`, and inventing a status
+   for it would force every state-machine guard to handle a value that is not
+   a state.
 
 Case 3 is rare but real, and it is resolved by a human — refund or rebook. The
 "no refunds" policy governs *player-initiated cancellation*; it does not apply
@@ -737,9 +789,84 @@ silent failure once; it is cheap to prevent here from the first commit.
 
 ---
 
-## 9. Still to design
+## 9. Deployment
 
-- **Deployment** — Vercel + Render + Supabase, environments, CI
+All free tier, all Singapore (`ap-southeast-1`) — the closest region to PH.
+
+| Component | Where | Why |
+|---|---|---|
+| `pikol-frontend` | Vercel | Next.js native |
+| `pikol-backend` | Render, Singapore | long-lived process |
+| Postgres + Storage | Supabase, Singapore | as in asima |
+
+### 9.1 Why the backend is not on Vercel
+
+The reason differs from asima's. Asima's blocker was the 4.5 MB function
+payload cap on file uploads; this system has no uploads. Here it is
+**connection pooling**: a serverless function opens and drops a connection per
+invocation, and Supabase's pooler has a modest connection budget. A long-lived
+Render process holds one properly-sized SQLAlchemy async pool instead of
+fighting that on every request.
+
+### 9.2 The Supabase pooler port — the gotcha specific to this stack
+
+Supabase exposes two pooler ports and **the wrong one silently breaks
+asyncpg**:
+
+- **Port 6543** (transaction pooler) does *not* support prepared statements.
+  SQLAlchemy async with asyncpg uses them by default, producing intermittent
+  `prepared statement "__asyncpg_stmt_1__" does not exist` errors under load —
+  passing locally, failing in production.
+- **Port 5432** (session pooler) is IPv4 and supports prepared statements.
+  **Use this**, as asima does.
+
+If 6543 is ever required it needs both `prepared_statement_cache_size=0` and
+`statement_cache_size=0`. This belongs in the config comments, because the
+failure looks like a database problem and is not.
+
+### 9.3 The sharpest free-tier consequence
+
+Render's free tier sleeps after 15 idle minutes and cold-starts in ~50 s — and
+that lands **squarely on the payment confirmation path**. A sleeping backend
+means PayMongo's webhook times out and retries while the player watches the
+return page spin. It resolves correctly, because retries and polling both
+work, but it feels broken.
+
+The UptimeRobot keep-alive ping is therefore **load-bearing here, not
+hygiene** — unlike in asima, where it only protected a demo. It also stops
+Supabase pausing after 7 idle days. Free, 5-minute interval, and it is the
+difference between a 2-second confirmation and a 50-second one.
+
+### 9.4 Carried from asima, already learned the hard way
+
+- **CORS trailing-slash trap** — `https://pikol.vercel.app/` does not match
+  `https://pikol.vercel.app`. Exact origins, no trailing slash.
+- **Migrations run from a laptop** against a gitignored `.env.supabase.prod`,
+  never from CI. Named `.prod` rather than `.local` for the same reason: on a
+  file holding production credentials, `.local` reads as "the safe one", and
+  that is the misreading that ends with a destructive command pointed at the
+  live database. Alembic replaces the TypeORM CLI; the warning is identical.
+- **`main.py` binds `0.0.0.0`** and respects Render's injected `PORT`.
+- **One Render service only.** A leftover duplicate makes Render's router flap:
+  ~50% of requests 404 with `x-render-routing: no-server` without ever reaching
+  the container.
+- **The frontend production build fails if `NEXT_PUBLIC_API_BASE_URL` is
+  unset**, rather than baking `localhost` into the bundle (§8.3).
+
+### 9.5 Secrets, CI, and phasing
+
+`PAYMONGO_SECRET_KEY` and `PAYMONGO_WEBHOOK_SECRET` are **server-only** —
+never `NEXT_PUBLIC_*`, which is compiled into the browser bundle. The frontend
+holds only `NEXT_PUBLIC_API_BASE_URL`.
+
+Rollout follows the provider port: **mock → PayMongo test → live**. The mock
+adapter pays off immediately in development, where webhooks need no ngrok
+tunnel because the mock posts a correctly-signed one to itself.
+
+CI per repo via GitHub Actions: backend `ruff` + `mypy` + `pytest`; frontend
+`eslint` + `tsc` + `build`.
+
+---
 
 ## 10. Open questions
 
