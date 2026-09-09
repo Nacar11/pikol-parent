@@ -69,6 +69,16 @@ TableGroup config [note: 'Business rules, tunable without a deploy'] {
 }
 
 // ═══════════════════════════ ENUMS ═══════════════════════════
+// These are NATIVE PostgreSQL enum types, not varchar + CHECK. They are
+// closed sets defined by a state machine, and the design leans on the
+// database refusing bad data — a typo'd 'CONFIRMEND' must be impossible.
+//
+// The cost, and it is real: Alembic autogenerate does NOT handle enum
+// changes. Adding a value is always a hand-written migration:
+//     ALTER TYPE booking_status ADD VALUE 'SOMETHING';
+// and every type must be declared create_type=False with an explicit
+// .create(op.get_bind(), checkfirst=True), or SQLAlchemy emits it twice and
+// the migration fails with "type already exists".
 
 Enum booking_type {
   PLAYER_BOOKING [note: 'Booked online by a registered player']

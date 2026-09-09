@@ -36,6 +36,13 @@ These apply to every task in every Pikol backend plan.
   `forbidNonWhitelisted: true`. (spec §3.3)
 - **No `if (env)` branches in application code.** Environment differences are
   expressed as configuration and adapter selection only. (spec §5.6)
+- **Enums are native PostgreSQL types**, not `varchar`. These are closed sets
+  defined by a state machine, and the design leans on the database refusing
+  bad data — a typo'd `'CONFIRMEND'` must be impossible, not merely unlikely.
+  The cost: Alembic autogenerate does **not** handle enum changes, so adding a
+  value is always a hand-written `ALTER TYPE ... ADD VALUE` migration, and
+  `create_type=False` plus an explicit `.create()` is required so the type is
+  made exactly once.
 - **The import root is `src`** (`from src.parameters... import ...`), matching
   the spec's file paths and asima's `src/` layout.
 - **Every read of `booking_status = 'PENDING'` also filters
@@ -59,7 +66,7 @@ pikol-backend/
 │   │   ├── base.py           DeclarativeBase
 │   │   ├── session.py        async engine + get_session dependency
 │   │   └── migrations/       alembic env.py + versions/
-│   ├── health/controllers/health.py
+│   ├── health/controllers/health.py   /health (liveness) + /health/ready (DB)
 │   ├── parameters/
 │   │   ├── domain/parameters.py       typed model + cross-field validation
 │   │   ├── persistence/models.py      SQLAlchemy model
@@ -67,16 +74,21 @@ pikol-backend/
 │   │   └── service.py                 TTL-cached accessor
 │   └── utils/
 │       ├── api.py            API_VERSION, API_PREFIX
-│       ├── request_id.py     X-Request-ID middleware
-│       └── errors.py         error envelope + exception handlers
+│       ├── request_id.py     X-Request-ID middleware + ContextVar
+│       ├── log.py            JSON lines carrying the request_id
+│       ├── errors.py         error envelope + exception handlers
+│       ├── pagination.py     Page[T] — the list envelope
+│       └── time.py           Manila day boundaries
 └── tests/
-    ├── conftest.py
+    ├── conftest.py                      client + rolling-back db_session
     ├── health/test_health.py
     ├── config/test_settings.py
     ├── database/test_session.py
     ├── parameters/test_parameters_domain.py
     ├── parameters/test_parameters_service.py
-    └── utils/test_request_id.py
+    ├── utils/test_request_id.py
+    ├── utils/test_pagination.py
+    └── utils/test_manila_time.py
 ```
 
 ---
@@ -436,7 +448,7 @@ over the transaction pooler (6543): asyncpg uses prepared statements, which
 
 ---
 
-### Task 3: Async database session
+### Task 3: Async session, readiness probe, and the rollback fixture
 
 **Files:**
 - Create: `pikol-backend/docker-compose.yml`
@@ -555,15 +567,121 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 Run: `uv run pytest tests/database/ -v`
 Expected: PASS — 1 passed
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Write the failing readiness test**
+
+Append to `tests/health/test_health.py`:
+
+```python
+async def test_readiness_touches_the_database(client: AsyncClient) -> None:
+    """Liveness and readiness are different questions, and here the
+    difference is load-bearing.
+
+    Spec §9.3 says the UptimeRobot ping stops Supabase pausing after 7 idle
+    days. Supabase pauses on *database* inactivity, so a probe that returns a
+    dict literal issues no query and does not keep it alive: Render stays
+    awake, Postgres pauses anyway, and the first real request after a quiet
+    week fails. The keep-alive must point HERE."""
+    response = await client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "database": "ok"}
+```
+
+- [ ] **Step 7: Run it to verify it fails**
+
+Run: `uv run pytest tests/health/ -v`
+Expected: FAIL — 404, the route does not exist
+
+- [ ] **Step 8: Implement readiness**
+
+Replace `src/health/controllers/health.py`:
+
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.database.session import get_session
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness. Deliberately touches nothing.
+
+    A database outage must not make the orchestrator kill a container that is
+    otherwise healthy and serving cached reads.
+    """
+    return {"status": "ok"}
+
+
+@router.get("/health/ready")
+async def ready(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
+    """Readiness. Issues a real query.
+
+    This is the endpoint the keep-alive monitor must hit: it is what keeps
+    Supabase from pausing the project after 7 idle days (spec §9.3).
+    """
+    await session.execute(text("SELECT 1"))
+    return {"status": "ready", "database": "ok"}
+```
+
+- [ ] **Step 9: Add a rollback fixture for database tests**
+
+Every test from Phase 2 onward writes rows. Without this, tests leak state
+into each other and pass or fail depending on order — and retrofitting it
+later means rewriting every test written before it.
+
+Append to `tests/conftest.py`:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.database.session import engine
+
+
+@pytest.fixture
+async def db_session() -> AsyncGenerator[AsyncSession, None]:
+    """A session inside a transaction that is always rolled back.
+
+    The test sees its own writes; the database never does. Nothing a test
+    writes can reach the next test.
+    """
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(bind=connection, expire_on_commit=False)
+        try:
+            yield session
+        finally:
+            await session.close()
+            await transaction.rollback()
+```
+
+- [ ] **Step 10: Run the full suite**
+
+Run: `uv run pytest -v`
+Expected: PASS — 6 passed
+
+- [ ] **Step 11: Commit**
 
 ```bash
 git add -A
-git commit -m "Add async SQLAlchemy engine and session dependency
+git commit -m "Add async session, readiness probe, and rollback test fixture
 
 pool_pre_ping is on because Supabase's pooler drops idle connections, and
 the pool is deliberately small: the session pooler has a limited connection
-budget and this is a long-lived process, not a serverless function."
+budget and this is a long-lived process, not a serverless function.
+
+Splits liveness from readiness because the difference is load-bearing here.
+The spec relies on a keep-alive ping to stop Supabase pausing after 7 idle
+days, but Supabase pauses on database inactivity — a probe returning a dict
+literal issues no query and would not have kept it alive. /health/ready runs
+SELECT 1 and is what the monitor must target.
+
+The db_session fixture rolls back every test transaction. Added now rather
+than in Phase 2 because retrofitting it means rewriting every test that
+came before."
 ```
 
 ---
@@ -595,6 +713,7 @@ Appendix A rather than inferred from the diagram.
 from datetime import datetime
 
 from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.database.base import Base
@@ -612,7 +731,15 @@ class ParameterModel(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
-    value_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    value_type: Mapped[str] = mapped_column(
+        SAEnum(
+            "int", "decimal", "bool", "string",
+            name="parameter_value_type",
+            native_enum=True,
+            create_type=False,  # the migration owns creation
+        ),
+        nullable=False,
+    )
     description: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -711,6 +838,7 @@ Revises:
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision = "0001_parameters"
 down_revision = None
@@ -742,12 +870,25 @@ SEED = [
 ]
 
 
+# create_type=False so the type is made exactly once, by the explicit
+# .create() below. Left at the default, SQLAlchemy also tries to emit it
+# while building the table and the migration fails with "type already
+# exists". Every enum in this project follows this shape.
+parameter_value_type = postgresql.ENUM(
+    "int", "decimal", "bool", "string",
+    name="parameter_value_type",
+    create_type=False,
+)
+
+
 def upgrade() -> None:
+    parameter_value_type.create(op.get_bind(), checkfirst=True)
+
     parameters = op.create_table(
         "parameters",
         sa.Column("key", sa.String(64), primary_key=True),
         sa.Column("value", sa.Text(), nullable=False),
-        sa.Column("value_type", sa.String(16), nullable=False),
+        sa.Column("value_type", parameter_value_type, nullable=False),
         sa.Column("description", sa.Text(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True),
                   server_default=sa.func.now(), nullable=False),
@@ -764,6 +905,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("parameters")
+    parameter_value_type.drop(op.get_bind(), checkfirst=True)
 ```
 
 - [ ] **Step 4: Run the migration**
@@ -961,6 +1103,7 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database.session import SessionLocal
+from src.parameters.persistence.repository import ParameterRepository
 from src.parameters.service import ParameterService
 
 
@@ -975,37 +1118,41 @@ async def test_loads_seeded_parameters_from_the_database() -> None:
     assert params.min_lead_minutes >= params.hold_duration_minutes
 
 
+class CountingRepository(ParameterRepository):
+    """Injected rather than monkeypatched — the service takes its repository
+    as a constructor argument, so the test needs no patching and no
+    type: ignore."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def load_all(self, session: AsyncSession) -> dict[str, str]:
+        self.calls += 1
+        return await super().load_all(session)
+
+
 async def test_second_call_within_ttl_does_not_query_again() -> None:
     """The accessor is read on every booking; hitting Postgres each time is
     waste. The TTL is short so an admin edit still lands quickly."""
-    service = ParameterService(ttl_seconds=60)
-    calls = 0
+    repository = CountingRepository()
+    service = ParameterService(repository, ttl_seconds=60)
 
-    original = ParameterService._load
+    async with SessionLocal() as session:
+        await service.get(session)
+        await service.get(session)
 
-    async def counting_load(self: ParameterService, session: AsyncSession) -> dict[str, str]:
-        nonlocal calls
-        calls += 1
-        return await original(self, session)
-
-    ParameterService._load = counting_load  # type: ignore[method-assign]
-    try:
-        async with SessionLocal() as session:
-            await service.get(session)
-            await service.get(session)
-    finally:
-        ParameterService._load = original  # type: ignore[method-assign]
-
-    assert calls == 1
+    assert repository.calls == 1
 
 
 async def test_expired_cache_reloads() -> None:
-    service = ParameterService(ttl_seconds=0)
+    repository = CountingRepository()
+    service = ParameterService(repository, ttl_seconds=0)
 
     async with SessionLocal() as session:
         first = await service.get(session)
         second = await service.get(session)
 
+    assert repository.calls == 2
     assert first == second
 ```
 
@@ -1051,21 +1198,22 @@ class ParameterService:
     admin changing the fee sees it take effect promptly without a deploy.
     """
 
-    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        repository: ParameterRepository | None = None,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> None:
+        self._repository = repository or ParameterRepository()
         self._ttl = ttl_seconds
-        self._repository = ParameterRepository()
         self._cached: Parameters | None = None
         self._loaded_at = 0.0
-
-    async def _load(self, session: AsyncSession) -> dict[str, str]:
-        return await self._repository.load_all(session)
 
     async def get(self, session: AsyncSession) -> Parameters:
         now = time.monotonic()
         if self._cached is not None and (now - self._loaded_at) < self._ttl:
             return self._cached
 
-        self._cached = Parameters.model_validate(await self._load(session))
+        self._cached = Parameters.model_validate(await self._repository.load_all(session))
         self._loaded_at = now
         return self._cached
 
@@ -1095,25 +1243,40 @@ already started."
 
 ---
 
-### Task 6: Request ID middleware and the error envelope
+### Task 6: Shared utilities — request ID, logging, errors, pagination, Manila time
+
+These are the cross-cutting pieces every later feature imports. They are one
+task because they share a home (`src/utils/`) and one reviewer gate; splitting
+them would mean five commits that individually do nothing.
 
 **Files:**
-- Create: `pikol-backend/src/utils/request_id.py`, `src/utils/errors.py`
-- Modify: `pikol-backend/src/main.py`
-- Test: `pikol-backend/tests/utils/test_request_id.py`
+- Create: `src/utils/request_id.py`, `src/utils/log.py`, `src/utils/errors.py`,
+  `src/utils/pagination.py`, `src/utils/time.py`
+- Modify: `src/main.py`
+- Test: `tests/utils/test_request_id.py`, `tests/utils/test_pagination.py`,
+  `tests/utils/test_manila_time.py`
 
 **Interfaces:**
-- Consumes: `src.main.create_app`.
-- Produces: `src.utils.request_id.RequestIDMiddleware`,
-  `src.utils.errors.ErrorResponse` (fields `detail: str`, `request_id: str`),
-  `src.utils.errors.register_exception_handlers(app: FastAPI) -> None`.
+- Consumes: `src.config.settings.Settings`, `get_settings`.
+- Produces:
+  - `src.utils.request_id.RequestIDMiddleware`, `request_id_var: ContextVar[str]`
+  - `src.utils.log.configure_logging(debug: bool) -> None`
+  - `src.utils.errors.ErrorResponse` (`detail: str`, `request_id: str`),
+    `register_exception_handlers(app: FastAPI) -> None`
+  - `src.utils.pagination.Page[T]` with `data, total, page, limit, has_more`
+    and `Page.of(data, total, page, limit) -> Page[T]`
+  - `src.utils.time.MANILA`, `manila_day_bounds(day: date) -> tuple[datetime, datetime]`
+  - `src.main.create_app(settings: Settings | None = None) -> FastAPI`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 `tests/utils/test_request_id.py`:
 
 ```python
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+
+from src.config.settings import Settings
+from src.main import create_app
 
 
 async def test_response_carries_a_request_id(client: AsyncClient) -> None:
@@ -1135,19 +1298,108 @@ async def test_ids_differ_between_requests(client: AsyncClient) -> None:
     second = await client.get("/health")
 
     assert first.headers["x-request-id"] != second.headers["x-request-id"]
+
+
+async def test_docs_are_hidden_when_not_debugging() -> None:
+    """asima 404s /docs in production. The OpenAPI schema lists every admin
+    route and its request shape — free reconnaissance."""
+    production = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@localhost:5432/pikol",
+        debug=False,
+    )
+    transport = ASGITransport(app=create_app(production))
+
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        assert (await c.get("/docs")).status_code == 404
+        assert (await c.get("/openapi.json")).status_code == 404
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+`tests/utils/test_manila_time.py`:
+
+```python
+from datetime import UTC, date, datetime, timedelta
+
+from src.utils.time import MANILA, manila_day_bounds
+
+
+def test_manila_day_begins_at_1600_utc_the_previous_day() -> None:
+    start, end = manila_day_bounds(date(2026, 9, 15))
+
+    assert start == datetime(2026, 9, 14, 16, 0, tzinfo=UTC)
+    assert end == datetime(2026, 9, 15, 16, 0, tzinfo=UTC)
+
+
+def test_bounds_span_exactly_one_day() -> None:
+    start, end = manila_day_bounds(date(2026, 9, 15))
+
+    assert end - start == timedelta(days=1)
+
+
+def test_the_midnight_slot_belongs_to_its_own_manila_day() -> None:
+    """This is the test that matters. The 12am-1am slot has its own price
+    rule, so misplacing it onto the previous day changes what a player is
+    charged. Slicing on `starts_at::date` in UTC puts it on 14 September."""
+    midnight_slot = datetime(2026, 9, 15, 0, 0, tzinfo=MANILA).astimezone(UTC)
+    start, end = manila_day_bounds(date(2026, 9, 15))
+
+    assert start <= midnight_slot < end
+
+
+def test_the_last_slot_of_the_day_is_inside_the_bounds() -> None:
+    last_slot = datetime(2026, 9, 15, 23, 0, tzinfo=MANILA).astimezone(UTC)
+    start, end = manila_day_bounds(date(2026, 9, 15))
+
+    assert start <= last_slot < end
+```
+
+`tests/utils/test_pagination.py`:
+
+```python
+from src.utils.pagination import Page
+
+
+def test_has_more_is_true_when_further_pages_exist() -> None:
+    page = Page.of(data=[1, 2, 3], total=10, page=1, limit=3)
+
+    assert page.has_more is True
+
+
+def test_has_more_is_false_on_the_last_partial_page() -> None:
+    page = Page.of(data=[10], total=10, page=4, limit=3)
+
+    assert page.has_more is False
+
+
+def test_has_more_is_false_when_the_page_exactly_ends_the_set() -> None:
+    """The off-by-one that makes a UI render an empty final page."""
+    page = Page.of(data=[1, 2, 3], total=3, page=1, limit=3)
+
+    assert page.has_more is False
+
+
+def test_empty_result_set() -> None:
+    page = Page.of(data=[], total=0, page=1, limit=20)
+
+    assert page.has_more is False
+    assert page.total == 0
+```
+
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/utils/ -v`
-Expected: FAIL — `KeyError: 'x-request-id'`
+Expected: FAIL — `ModuleNotFoundError` for `src.utils.time` and
+`src.utils.pagination`, and `KeyError: 'x-request-id'`
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Implement the request ID and logging**
 
 `src/utils/request_id.py`:
 
 ```python
+import logging
+import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from uuid import uuid4
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1156,20 +1408,83 @@ from starlette.responses import Response
 
 HEADER = "X-Request-ID"
 
+# Read by the log formatter, so any log line anywhere in the request carries
+# the ID without every call site having to thread it through.
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+
+logger = logging.getLogger("pikol.request")
+
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
-    """Attach a request ID to every response, echoing the caller's if present
-    so frontend and backend log lines can be correlated (spec §3.5)."""
+    """Tag every request, echo the caller's ID if it sent one (spec §3.5)."""
 
     async def dispatch(
         self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         request_id = request.headers.get(HEADER) or str(uuid4())
+        token = request_id_var.set(request_id)
         request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers[HEADER] = request_id
-        return response
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            logger.info(
+                "%s %s %s %sms",
+                request.method,
+                request.url.path,
+                response.status_code,
+                elapsed_ms,
+            )
+            response.headers[HEADER] = request_id
+            return response
+        finally:
+            request_id_var.reset(token)
 ```
+
+`src/utils/log.py`:
+
+```python
+import json
+import logging
+import sys
+from typing import Any
+
+from src.utils.request_id import request_id_var
+
+
+class JsonFormatter(logging.Formatter):
+    """JSON lines, because Render's log viewer is grep and nothing else.
+
+    Every record carries the current request_id, so one failed booking can be
+    traced across every line it produced.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": request_id_var.get(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def configure_logging(debug: bool) -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+```
+
+> **Never log a provider payload.** `webhook_events.payload` and
+> `payments.raw_payload` hold payer name, email, and mobile. Log the
+> `provider_event_id` and the outcome; the payload stays in the table and is
+> purged on schedule (spec §7.5).
+
+- [ ] **Step 4: Implement the error envelope**
 
 `src/utils/errors.py`:
 
@@ -1189,7 +1504,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(IntegrityError)
     async def handle_integrity_error(request: Request, exc: IntegrityError) -> JSONResponse:
         """A unique-constraint violation is the *expected* outcome when two
-        players race for one slot (spec §4.1) — it is a 409, not a 500."""
+        players race for one slot (spec §4.1) — a 409, not a 500."""
         return JSONResponse(
             status_code=409,
             content=ErrorResponse(
@@ -1199,22 +1514,99 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 ```
 
-Update `src/main.py`:
+- [ ] **Step 5: Implement pagination**
+
+`src/utils/pagination.py`:
+
+```python
+from typing import Generic, TypeVar
+
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    """The list envelope every collection endpoint returns (spec §3.5).
+
+    One shape, defined once, so the frontend's pagination components target it
+    directly instead of learning a new response per endpoint.
+    """
+
+    data: list[T]
+    total: int
+    page: int
+    limit: int
+    has_more: bool
+
+    @classmethod
+    def of(cls, data: list[T], total: int, page: int, limit: int) -> "Page[T]":
+        return cls(
+            data=data,
+            total=total,
+            page=page,
+            limit=limit,
+            has_more=(page * limit) < total,
+        )
+```
+
+- [ ] **Step 6: Implement Manila day boundaries**
+
+`src/utils/time.py`:
+
+```python
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+MANILA = ZoneInfo("Asia/Manila")
+
+
+def manila_day_bounds(day: date) -> tuple[datetime, datetime]:
+    """Half-open UTC bounds [start, end) of one Manila calendar day.
+
+    EVERY day-bounded query goes through this. Writing
+    `WHERE starts_at::date = :day` instead slices on UTC days, which returns
+    the wrong 24 hours and puts the 12am-1am slot — the one with its own
+    price rule — on the previous day's grid.
+
+    PH has no DST, so the offset is a fixed +08 and this needs no special
+    cases.
+    """
+    start = datetime.combine(day, time.min, tzinfo=MANILA)
+    return start.astimezone(UTC), (start + timedelta(days=1)).astimezone(UTC)
+```
+
+- [ ] **Step 7: Wire it all into the app**
+
+Replace `src/main.py`:
 
 ```python
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.config.settings import get_settings
+from src.config.settings import Settings, get_settings
 from src.health.controllers.health import router as health_router
 from src.utils.errors import register_exception_handlers
+from src.utils.log import configure_logging
 from src.utils.request_id import RequestIDMiddleware
 
 
-def create_app() -> FastAPI:
-    settings = get_settings()
-    app = FastAPI(title="Pikol API", version="0.1.0")
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.debug)
 
+    # OpenAPI lists every admin route and its request shape, so it is off
+    # outside development — the same call asima makes.
+    app = FastAPI(
+        title="Pikol API",
+        version="0.1.0",
+        docs_url="/docs" if settings.debug else None,
+        redoc_url=None,
+        openapi_url="/openapi.json" if settings.debug else None,
+    )
+
+    # add_middleware prepends, so CORS ends up OUTERMOST — which is what a
+    # preflight request needs.
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(
         CORSMiddleware,
@@ -1233,24 +1625,34 @@ def create_app() -> FastAPI:
 app = create_app()
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 8: Run the full suite**
 
 Run: `uv run pytest -v`
-Expected: PASS — 14 passed
+Expected: PASS — 22 passed
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add -A
-git commit -m "Add request ID middleware and 409 handler for slot races
+git commit -m "Add shared utilities: request ID, logging, pagination, Manila time
 
-X-Request-ID is echoed when the caller supplies one, which is what makes a
-frontend log line joinable to a backend one.
+The Manila helper is the important one. The day-boundary rule is the single
+most dangerous thing in the spec — 'starts_at::date' returns the wrong 24
+hours and moves the 12am-1am slot, which has its own price rule, onto the
+previous day. Making it a tested function turns 'everyone must remember
+this' into 'you cannot get this wrong', and the test that pins it asserts
+exactly that slot lands inside its own day.
 
-IntegrityError maps to 409 rather than 500 because a unique-constraint
-violation on booking_slots is the expected outcome of two players racing for
-the same slot, not a server fault. The 409 arrives in Phase 4; the handler
-exists now so the mapping is never written as a 500 by accident."
+Logging is JSON lines carrying the current request_id from a ContextVar, so
+one failed booking is traceable across every line it produced without
+threading an ID through every call site. Provider payloads are never
+logged — they hold payer PII and live in their tables until purged.
+
+Page is defined once so the frontend targets one shape; its test pins the
+off-by-one where a page exactly ending the set reports has_more.
+
+/docs and /openapi.json are off outside development: the schema lists every
+admin route and its request shape."
 ```
 
 ---
@@ -1461,7 +1863,12 @@ starting Phase 2 — a red main branch at the foundation stage compounds.
       10 seeded rows
 - [ ] `alembic downgrade base` succeeds
 - [ ] `ParameterService.get()` returns typed values and rejects a bad one
-- [ ] Every response carries `X-Request-ID`
+- [ ] `/health/ready` returns `{"status": "ready", "database": "ok"}` and is
+      what the keep-alive monitor targets
+- [ ] Every response carries `X-Request-ID`, and log lines carry it too
+- [ ] `/docs` is 404 when `debug` is false
+- [ ] `manila_day_bounds(date(2026, 9, 15))` starts at `2026-09-14T16:00Z`
+- [ ] The `db_session` fixture rolls back, so tests cannot leak state
 - [ ] `ruff`, `mypy --strict`, and `pytest` all pass
 - [ ] CI is green on `main`
 - [ ] `CLAUDE.md` exists and states the non-negotiables
@@ -1473,5 +1880,10 @@ starting Phase 2 — a red main branch at the foundation stage compounds.
 - `Base` — auth models extend it
 - `parameter_service` — reads `invitation_expiry_days`
 - `register_exception_handlers` — auth error types are added here
+- `Page[T]` — every list endpoint returns it
+- `manila_day_bounds` — every day-bounded query
+- `db_session` — the fixture every write test uses
+- The native-enum migration shape — `create_type=False` plus an explicit
+  `.create()`, copied for `booking_status`, `payment_status`, and the rest
 - `ParameterModel.updated_by_user_id` — gains its FK to `users` in Phase 2's
   migration
