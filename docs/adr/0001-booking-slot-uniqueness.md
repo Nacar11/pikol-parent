@@ -70,11 +70,14 @@ scheduler — so a `PENDING` row on an uncontested slot persists indefinitely.
 `booking_status = 'PENDING'` therefore never means "currently holding", and
 every read of it must also filter `expires_at > now()`. See spec §4.3.
 
-## The ERD is a picture, not the source of truth
+## Where the schema lives
 
-`pikol.dbml` renders the schema, but **DBML cannot express either constraint
-above** — it has no `WHERE` clause and no `NULLS NOT DISTINCT`. Both render as
-plain unique constraints. Generating DDL from that file would forbid ever
-rebooking a cancelled slot, and would silently drop the price-rule guard.
+**[`pikol.dbml`](./pikol.dbml) is the source of truth.** Schema changes are
+made there first; Alembic migrations are written from it.
 
-Alembic migrations are authoritative. The `.dbml` is for reading.
+DBML itself cannot express a `WHERE` clause or `NULLS NOT DISTINCT`, so both
+constraints above — and every `CHECK` — are written as exact, copy-pasteable
+DDL in **Appendix A** of that file. The rendered diagram shows them as
+ordinary unique indexes, which is why the two affected tables are marked ⚠️
+and why building from the picture alone would produce a schema that looks
+right and silently is not.

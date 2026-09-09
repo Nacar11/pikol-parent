@@ -576,6 +576,11 @@ budget and this is a long-lived process, not a serverless function."
 - Create: `pikol-backend/src/database/migrations/versions/0001_parameters.py`
 - Create: `pikol-backend/src/parameters/persistence/models.py`
 
+**Schema source:** [`../adr/pikol.dbml`](../adr/pikol.dbml) — the `parameters`
+table and its ten seeded keys (Appendix B). Every later phase's migration is
+written from that file, and any constraint it marks ⚠️ must be copied from its
+Appendix A rather than inferred from the diagram.
+
 **Interfaces:**
 - Consumes: `src.database.base.Base`, `src.config.settings.get_settings`.
 - Produces: `src.parameters.persistence.models.ParameterModel` with columns

@@ -191,6 +191,13 @@ and approval chains. A `Venue { id, name, address }` does not.
 
 ## 4. Data model
 
+> **The schema's source of truth is [`../adr/pikol.dbml`](../adr/pikol.dbml).**
+> Change it there first; Alembic migrations are written from it. Its Appendix
+> A carries the partial indexes, functional indexes, `NULLS NOT DISTINCT`, and
+> `CHECK` constraints that DBML cannot express — omitting them yields a schema
+> that looks correct and silently is not. The sketch below is a reading aid;
+> where the two disagree, the `.dbml` wins.
+
 ```
 parameters      key PK, value, value_type, description, updated_at, updated_by
 roles           id, code, name
