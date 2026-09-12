@@ -62,6 +62,7 @@ commit is the one ruff would produce.
 ```
 pikol-backend/
 ├── pyproject.toml            deps, ruff, mypy, pytest config
+├── .python-version           pins the interpreter — 3.12, matching mypy/ruff
 ├── docker-compose.yml        local Postgres only
 ├── alembic.ini
 ├── .env.example              every var, with comments
@@ -104,7 +105,7 @@ pikol-backend/
 ### Task 1: Repo scaffold and health endpoint
 
 **Files:**
-- Create: `pikol-backend/pyproject.toml`, `.gitignore`, `README.md`
+- Create: `pikol-backend/pyproject.toml`, `.gitignore`, `.python-version`
 - Create: `pikol-backend/src/main.py`, `src/utils/api.py`
 - Create: `pikol-backend/src/health/controllers/health.py`
 - Test: `pikol-backend/tests/conftest.py`, `tests/health/test_health.py`
@@ -205,11 +206,21 @@ tasks/
 .DS_Store
 ```
 
-Then install:
+Pin the interpreter, then install:
 
 ```bash
+uv python pin 3.12
 uv sync
 ```
+
+**Pin before syncing.** `requires-python = ">=3.12"` is a floor, not a pin —
+uv resolves the newest Python that satisfies it (3.14 at time of writing),
+while mypy is configured `python_version = "3.12"` and ruff
+`target-version = "py312"`. Left unpinned the type checker reasons about a
+different Python than the one running the tests, and CI — which calls
+`setup-uv` with no version — drifts on its own schedule as new releases
+land. `.python-version` is committed, so local and CI agree and stay that
+way.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -298,10 +309,13 @@ def create_app() -> FastAPI:
 app = create_app()
 ```
 
-Add empty `__init__.py` to every package directory under `src/` and `tests/`:
+Add empty `__init__.py` to every package directory under `src/` and `tests/`.
+The `__pycache__` exclusion matters: Step 3 already ran pytest, so
+`tests/__pycache__/` exists by now and a bare `-type d` plants a stray
+`__init__.py` inside it.
 
 ```bash
-find src tests -type d -exec touch {}/__init__.py \;
+find src tests -type d -not -path "*__pycache__*" -exec touch {}/__init__.py \;
 ```
 
 - [ ] **Step 5: Run the test to verify it passes**
