@@ -126,6 +126,7 @@ Enum provider_payment_status {
   PAID
   FAILED
   EXPIRED
+  CANCELLED [note: 'Maya PAYMENT_CANCELLED — the payer backed out. Distinct from FAILED (ADR 0002)']
 }
 
 Enum parameter_value_type {
