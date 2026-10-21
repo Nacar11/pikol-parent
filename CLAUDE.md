@@ -25,7 +25,7 @@ its own `origin` and its own `main`.
 | Repo | GitHub | State |
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
-| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 1 complete, CI green |
+| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 2 complete |
 | `pikol-frontend` | not created | Phase 6 |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
@@ -33,9 +33,11 @@ the frontend tree.
 
 ## Current state
 
-**Phase 1 (backend foundation) is complete** — the app boots, `/health` and
-`/health/ready` respond, Alembic migrates, `parameters` is seeded and typed,
-and CI is green on `main`. Phase 2 (identity and auth) is next.
+**Phase 2 (identity and auth) is complete** — players register, verify, log
+in, refresh, and reset passwords; admins and managers invite staff;
+`VenueScope` is enforced on venue-owned reads; the first `SUPER_ADMIN` comes
+from `uv run python -m src.users.cli create-super-admin`. Phase 3 (venues,
+courts, pricing) is next. The payment provider is **Maya** (ADR 0002).
 
 The roadmap and its phase order live in
 [`docs/plans/2026-09-09-implementation-roadmap.md`](docs/plans/2026-09-09-implementation-roadmap.md).
@@ -226,6 +228,8 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
   — the nine phases, their dependencies, and why that order.
 - [`docs/plans/2026-09-09-phase-1-backend-foundation.md`](docs/plans/2026-09-09-phase-1-backend-foundation.md)
   — Phase 1, task by task. Complete.
+- [`docs/plans/2026-10-21-phase-2-identity-auth.md`](docs/plans/2026-10-21-phase-2-identity-auth.md)
+  — Phase 2, task by task. Complete.
 - [`docs/adr/pikol.dbml`](docs/adr/pikol.dbml) — the schema, plus Appendix A
   (DDL the diagram cannot express) and Appendix B (seed data).
 - [`docs/adr/0001-booking-slot-uniqueness.md`](docs/adr/0001-booking-slot-uniqueness.md)
