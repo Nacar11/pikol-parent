@@ -15,7 +15,7 @@ directory.
 ```
 pikol-parent/        # this repo — docs, plans, ADRs, the ERD, this brief
 ├── pikol-backend/   # FastAPI + SQLAlchemy 2.0 async + Postgres. See its own CLAUDE.md.
-└── pikol-frontend/  # Next.js 15 App Router. Created in Phase 6; does not exist yet.
+└── pikol-frontend/  # Next.js 15 App Router. See its own CLAUDE.md.
 ```
 
 The sub-apps are **separate git repositories**, not submodules, sitting as
@@ -26,20 +26,23 @@ its own `origin` and its own `main`.
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
 | `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 5 on mock Maya |
-| `pikol-frontend` | not created | Phase 6 |
+| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | Phase 6 complete |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
 the frontend tree.
 
 ## Current state
 
-**Phases 1–4 are complete, and Phase 5 runs end to end on a mock Maya** —
-foundation; identity and auth; venues, courts, and pricing; the booking core
-(grid, holds, walk-ins, closures); and payments: checkout on every hold, an
-untrusted-webhook-then-re-fetch confirmation path, late-payment
-re-acquisition, a resolution queue, and receipts. The real `MayaProvider`
-adapter is the one Phase 5 piece left; it needs Maya sandbox keys. The first
-`SUPER_ADMIN` comes from `uv run python -m src.users.cli create-super-admin`.
+**Phases 1–4 are complete, Phase 5 runs end to end on a mock Maya, and
+Phase 6 (frontend foundation) is complete.** The backend covers identity,
+venues and pricing, the booking core, and payments (checkout, untrusted
+webhook + re-fetch, late-payment re-acquisition, resolution queue,
+receipts). The frontend has the Next.js scaffold, the API client with
+single-flight refresh, and every sign-in/registration/recovery screen;
+`/venues` and `/staff` are placeholders. **Next: Phase 7, the player
+booking flow.** The real `MayaProvider` is deferred until sandbox keys
+exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
+create-super-admin`.
 
 The roadmap and its phase order live in
 [`docs/plans/2026-09-09-implementation-roadmap.md`](docs/plans/2026-09-09-implementation-roadmap.md).
@@ -238,6 +241,8 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
   — Phase 4, task by task. Complete.
 - [`docs/plans/2026-10-21-phase-5-payments-mock.md`](docs/plans/2026-10-21-phase-5-payments-mock.md)
   — Phase 5 on the mock provider. Complete; the Maya adapter follows.
+- [`docs/plans/2026-10-21-phase-6-frontend-foundation.md`](docs/plans/2026-10-21-phase-6-frontend-foundation.md)
+  — Phase 6, the frontend foundation and auth screens. Complete.
 - [`docs/adr/pikol.dbml`](docs/adr/pikol.dbml) — the schema, plus Appendix A
   (DDL the diagram cannot express) and Appendix B (seed data).
 - [`docs/adr/0001-booking-slot-uniqueness.md`](docs/adr/0001-booking-slot-uniqueness.md)
