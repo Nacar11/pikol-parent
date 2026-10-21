@@ -1,7 +1,7 @@
 # pikol
 
 Pikol is a **pickleball court booking** system: one owner, many venues, many
-courts, clock-aligned hourly slots, online payment via PayMongo. Registered
+courts, clock-aligned hourly slots, online payment via Maya. Registered
 players book and pay online; staff book walk-ins and collect cash at the
 counter. Both paths write the same tables and pass the same constraint.
 
@@ -230,6 +230,9 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
   (DDL the diagram cannot express) and Appendix B (seed data).
 - [`docs/adr/0001-booking-slot-uniqueness.md`](docs/adr/0001-booking-slot-uniqueness.md)
   — why a closure is a booking row. Read before touching occupancy.
+- [`docs/adr/0002-maya-payment-provider.md`](docs/adr/0002-maya-payment-provider.md)
+  — Maya replaces PayMongo: unsigned webhooks, fixed one-hour checkouts,
+  decimal-peso amounts. Read before touching payments.
 
 ## Deployment (planned — Phase 9, not live)
 
@@ -246,9 +249,13 @@ All free tier, all Singapore (`ap-southeast-1`), the closest region to PH.
 - **Use Supabase's session pooler on port 5432, never the transaction pooler
   on 6543.** asyncpg uses prepared statements; 6543 does not support them, and
   it fails intermittently *only* under production load.
-- **`PAYMONGO_SECRET_KEY` and `PAYMONGO_WEBHOOK_SECRET` are server-only.**
-  Never `NEXT_PUBLIC_*` — that is compiled into the browser bundle. The
-  frontend holds only `NEXT_PUBLIC_API_BASE_URL`.
+- **`MAYA_PUBLIC_KEY` and `MAYA_SECRET_KEY` are server-only.** Never
+  `NEXT_PUBLIC_*` — that is compiled into the browser bundle. "Public" is
+  Maya's name for the checkout key, not permission to ship it. The frontend
+  holds only `NEXT_PUBLIC_API_BASE_URL`.
+- **Maya webhooks are unsigned.** Never trust the body: re-fetch the payment
+  from Maya and act on that. See
+  [`docs/adr/0002-maya-payment-provider.md`](docs/adr/0002-maya-payment-provider.md).
 - **Production credentials are never committed.** They live in a gitignored
   `.env.supabase.prod` — named `.prod`, not `.local`, because on a file
   holding production credentials "`.local`" reads as *the safe one*, and that
@@ -264,10 +271,10 @@ All free tier, all Singapore (`ap-southeast-1`), the closest region to PH.
   issues no query and does not keep it alive. It is load-bearing here, not
   hygiene: it also keeps Render awake, and a cold start lands squarely on the
   payment confirmation path.
-- **PayMongo live mode needs a registered PH business** (DTI/SEC + BIR). That
+- **Maya live mode needs a registered PH business** (DTI/SEC + BIR). That
   is the long pole and no code shortens it — start it early.
 
-Rollout follows the provider port: **mock → PayMongo test → live**.
+Rollout follows the provider port: **mock → Maya sandbox → live**.
 
 ## Working style
 

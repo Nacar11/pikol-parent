@@ -24,7 +24,7 @@ Project pikol {
   database_type: 'PostgreSQL'
   Note: '''
   Single owner → many venues → many courts. Courts sell clock-aligned
-  one-hour slots, 24/7. Registered players book and pay online via PayMongo;
+  one-hour slots, 24/7. Registered players book and pay online via Maya;
   staff book walk-ins and collect cash. Both paths write the same tables and
   pass the same uniqueness constraint.
 
@@ -105,9 +105,9 @@ Enum payment_status {
 }
 
 Enum payment_method {
-  PAYMONGO     [note: 'Online. Player also pays the convenience fee']
+  ONLINE       [note: 'Through the payment provider. Player also pays the convenience fee. A method, not a provider name — ADR 0002']
   CASH         [note: 'Counter. No fee']
-  MANUAL_GCASH [note: 'Scanned the venue QR. PayMongo never sees it. No fee']
+  MANUAL_GCASH [note: 'Scanned the venue QR. The provider never sees it. No fee']
 }
 
 Enum token_purpose {
@@ -117,8 +117,8 @@ Enum token_purpose {
 }
 
 Enum payment_provider {
-  MOCK     [note: 'Dev and tests. Posts a correctly-signed webhook to itself']
-  PAYMONGO
+  MOCK     [note: 'Dev and tests. Posts a webhook to itself; fetch_payment returns the recorded outcome']
+  MAYA     [note: 'Maya Checkout. Webhooks are unsigned — re-fetch the payment (ADR 0002)']
 }
 
 Enum provider_payment_status {
@@ -431,7 +431,7 @@ Table payments {
   booking_group_id     integer                 [not null]
   provider             payment_provider        [not null]
   provider_checkout_id varchar(128)            [not null, unique]
-  provider_payment_id  varchar(128)            [null]
+  provider_payment_id  varchar(128)            [null, note: 'For Maya, equals provider_checkout_id — the checkoutId IS the paymentId']
   amount_centavos      integer                 [not null]
   status               provider_payment_status [not null]
   raw_payload          jsonb                   [null, note: '⚠️ PII — purged after webhook_payload_retention_days. NEVER logged']
@@ -448,7 +448,7 @@ Table payments {
 Table webhook_events {
   id                integer          [pk, increment]
   provider          payment_provider [not null]
-  provider_event_id varchar(128)     [not null, unique, note: 'THE idempotency key. Insert first; the unique violation IS the already-processed check']
+  provider_event_id varchar(128)     [not null, unique, note: 'THE idempotency key. Insert first; the unique violation IS the already-processed check. Maya events have no ID: "{payment_id}:{payment_status}"']
   payload           jsonb            [not null, note: '⚠️ PII — purged after webhook_payload_retention_days. NEVER logged']
   processed_at      timestamptz      [null]
   received_at       timestamptz      [not null, default: `now()`]
@@ -463,7 +463,10 @@ Table webhook_events {
   without acting. There is no if-already-handled branch to get wrong and no
   race between two concurrent redeliveries.
 
-  PayMongo retries, and retries must be free.
+  Maya retries, and retries must be free.
+
+  The payload is UNTRUSTED. Maya does not sign webhooks: the handler acts on
+  the payment re-fetched from Maya, never on this body (ADR 0002).
   '''
 }
 

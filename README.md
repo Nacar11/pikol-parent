@@ -1,7 +1,7 @@
 # Pikol
 
 Pickleball court booking system — single owner, many venues, many courts,
-clock-aligned hourly slots, online payments via PayMongo.
+clock-aligned hourly slots, online payments via Maya.
 
 ## Layout
 

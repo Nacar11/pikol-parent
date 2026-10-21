@@ -5,6 +5,9 @@
 implementation plan. No application code exists yet.
 **Scope:** Full system design for a single-owner, multi-venue pickleball court
 booking platform with online payments, ahead of any implementation.
+**Amended 2026-10-21:** the payment provider is **Maya**, not PayMongo — see
+[ADR 0002](../adr/0002-maya-payment-provider.md). Sections it touches are
+marked inline; where they disagree, the ADR wins.
 
 ---
 
@@ -43,7 +46,7 @@ decision closed off an obvious alternative, the reason is recorded.
 | # | Decision | Notes |
 |---|---|---|
 | 1 | **Single-tenant**, one owner, many venues | Venue is a grouping + scheduling boundary, not a tenancy boundary |
-| 2 | **PayMongo**, not Stripe | See §2.1 |
+| 2 | **Maya** (was PayMongo), not Stripe | See §2.1 and ADR 0002 |
 | 3 | **Clock-aligned hourly slots** | Not arbitrary ranges — see §2.2 |
 | 4 | **24/7 bookable**; closures are the exception | No operating-hours config in v1 |
 | 5 | **Maintenance closure is a booking row** | Gives one race-proof constraint for all collisions |
@@ -59,7 +62,7 @@ decision closed off an obvious alternative, the reason is recorded.
 | 15 | Max **3 active holds** per player | Denial-of-inventory cap |
 | 16 | **Player pays a flat convenience fee** online; walk-ins pay none | See §4.4 |
 | 17 | Staff set `COMPLETED` / `NO_SHOW`; **`IN_PROGRESS` is derived** | |
-| 18 | **Mock payment provider first** → PayMongo test → live | Validates the port/adapter boundary |
+| 18 | **Mock payment provider first** → Maya sandbox → live | Validates the port/adapter boundary |
 | 19 | **Three repos**, asima-style | parent + backend + frontend |
 | 20 | All free tiers; cold starts accepted | Keep-alive is load-bearing, see §9.3 |
 | 21 | Players **verify email at signup**; staff are **invited** | Manager may create `VENUE_STAFF` only |
@@ -69,6 +72,10 @@ decision closed off an obvious alternative, the reason is recorded.
 | 25 | All day boundaries are **Manila-local**, not UTC | §4; otherwise the 12am slot lands on the wrong day |
 
 ### 2.1 Why PayMongo and not Stripe
+
+> **Superseded 2026-10-21 by [ADR 0002](../adr/0002-maya-payment-provider.md):
+> the provider is Maya.** The case against Stripe below still holds; the case
+> *for* PayMongo is kept as the record of the original decision.
 
 Stripe operates in the Philippines, but three things disqualify it here:
 
@@ -399,18 +406,19 @@ webhook confirms a session that began 7 minutes ago. The "not past" check runs
 at hold creation and never again. **Walk-ins are exempt** — staff are booking
 someone standing at the counter.
 
-The PayMongo checkout session expiry is **derived**, not configured:
-`hold_duration_minutes − 3`. Deriving it guarantees the checkout can never
-outlive the hold that backs it, which is the §5.5 hazard.
+~~The PayMongo checkout session expiry is derived as
+`hold_duration_minutes − 3`.~~ **Maya Checkout's lifetime is fixed at one hour
+and cannot be shortened** (ADR 0002 §2), so a checkout *can* outlive its hold.
+The §5.5 late-payment path carries that case instead.
 
 Values load through a Pydantic model with a short TTL cache, so `"abc"` in
 `convenience_fee_percent` fails loudly at load rather than silently zeroing
 every fee. Admin-only writes; `updated_by` gives an audit trail on the numbers
 that move money.
 
-**Why a flat fee percentage.** PayMongo's rate depends on the method (~2.5%
-wallets, ~3.5% + ₱15 cards), but the player chooses their method on PayMongo's
-hosted page *after* the amount is fixed. Charging exact pass-through would
+**Why a flat fee percentage.** The provider's rate depends on the method
+(wallets and QR Ph cheaper than cards), but the player chooses their method on
+Maya's hosted page *after* the amount is fixed. Charging exact pass-through would
 require method selection in our own UI and a method-restricted checkout
 session — more UI, more failure modes, and a few pesos of accuracy. One
 tunable number wins.
@@ -451,7 +459,7 @@ at every read and cannot drift.
 |---|---|---|---|
 | — | `PENDING/UNPAID` | Player | Slots free, on the hour, within horizon, ≥ `min_lead_minutes` away, < `max_active_holds_per_player` **unexpired** holds |
 | — | `CONFIRMED/UNPAID` | Staff | Slots free; may backdate ≤ `staff_backdate_days` |
-| `PENDING` | `CONFIRMED` | **Webhook only** | Signature verified, event not already processed |
+| `PENDING` | `CONFIRMED` | **Webhook only** | Payment re-fetched from the provider and matches; event not already processed |
 | `PENDING` | `EXPIRED` | System | `expires_at <= now()` |
 | `PENDING` | `CANCELLED` | Player | Explicit abandon |
 | `CONFIRMED/UNPAID` | `CONFIRMED/PAID` | Staff | Walk-in cash or manual GCash collected |
@@ -476,14 +484,15 @@ Terminal: `COMPLETED`, `NO_SHOW`, `CANCELLED`, `EXPIRED`.
    - insert `booking_group` (`PENDING/UNPAID`, `expires_at = now + hold`)
    - insert one `booking_slot` per hour
    - `IntegrityError` → `409 Slot no longer available`
-3. **Commit, then** call PayMongo to create a checkout session. The external
+3. **Commit, then** call Maya to create a checkout. The external
    call is deliberately outside the transaction — holding one open across a
-   network round-trip is how connection pools die. If PayMongo fails, return
+   network round-trip is how connection pools die. If Maya fails, return
    `502` and let the hold expire naturally.
 4. Store `provider_checkout_id`; return `checkout_url`; frontend redirects.
-5. Player pays on PayMongo's hosted page.
-6. **Webhook** `checkout_session.payment.paid` → verify signature → idempotency
-   check → `CONFIRMED/PAID` → send receipt email.
+5. Player pays on Maya's hosted page.
+6. **Webhook** `PAYMENT_SUCCESS` → **re-fetch the payment from Maya** (Maya
+   does not sign webhooks — ADR 0002 §1) → check amount and reference →
+   idempotency check → `CONFIRMED/PAID` → send receipt email.
 7. Player is redirected back to our success page, which **reads booking state
    from our database**.
 
@@ -493,10 +502,14 @@ URL must not. The webhook is the only authority.
 
 ### 5.4 Webhook handling
 
-- **Signature verified** before the payload is parsed or trusted.
+- **The webhook body is never trusted.** Maya does not sign webhooks, so the
+  handler takes only the payment ID and re-fetches the payment from Maya with
+  the secret key; the fetched status, amount, and `requestReferenceNumber` are
+  what it acts on (ADR 0002 §1). The source-IP allowlist is defence in depth.
 - **Idempotent by construction:** insert `webhook_events.provider_event_id`
-  first; a unique violation means "already processed" and the handler returns
-  `200` without acting. PayMongo retries, and retries must be free.
+  (`"{payment_id}:{status}"` — Maya events carry no event ID) first; a unique
+  violation means "already processed" and the handler returns `200` without
+  acting. Maya retries, and retries must be free.
 - **Out-of-order safe:** only forward transitions are permitted, so a late
   duplicate cannot walk a `COMPLETED` booking back to `CONFIRMED`.
 - **Always `200` once recorded.** A `500` triggers redelivery; a non-retryable
@@ -504,14 +517,19 @@ URL must not. The webhook is the only authority.
 
 ### 5.5 The known hazard: payment landing after the hold expires
 
+> **Amended by ADR 0002 §2.** Maya checkouts live a fixed hour, so mitigation
+> 1 below is unavailable and late payment is an *expected* path, not a rare
+> one. Mitigation 2 also rejects slots that have already started, and the
+> resolution queue may **void** same-day payments.
+
 A player pays at 15:01 against a 15:00 hold. The webhook arrives for an
 `EXPIRED` group whose slot may already belong to someone else. **This is the
 one case where money can exist without a court.**
 
 Mitigations, in order:
 
-1. Set the **PayMongo session expiry shorter than our hold window** (~12 min
-   against 15) so payment cannot normally land after the hold dies.
+1. ~~Set the provider session expiry shorter than our hold window.~~
+   Not possible with Maya (fixed one-hour checkout).
 2. On a late `payment.paid`, **attempt to re-acquire the slots**. If they are
    still free, the booking is restored and nobody notices.
 3. If re-acquisition fails, set `needs_resolution = true` and surface the
@@ -531,16 +549,20 @@ bug to design away.
 class PaymentProvider(Protocol):
     async def create_checkout(self, *, amount_centavos: int,
                               reference: str, description: str) -> CheckoutSession: ...
-    def verify_webhook(self, payload: bytes, signature: str) -> WebhookEvent: ...
+    def parse_webhook(self, payload: bytes) -> WebhookNotice: ...          # untrusted
+    async def fetch_payment(self, payment_id: str) -> ProviderPayment: ...  # authoritative
 ```
 
 Two adapters, selected by a `PAYMENT_PROVIDER` env var — never an `if (env)`
 branch in application code, exactly as asima's storage adapter is switched:
 
 - **`MockProvider`** — development and tests. Returns a local checkout URL and
-  exposes a "simulate payment" endpoint that posts a correctly-signed webhook.
-  The whole flow is testable with no PayMongo account.
-- **`PayMongoProvider`** — test keys, then live keys.
+  exposes a "simulate payment" endpoint that records the outcome and posts a
+  webhook to itself; its `fetch_payment` returns the recorded outcome, so the
+  mock runs the same notify-then-fetch path as Maya. The whole flow is
+  testable with no Maya account.
+- **`MayaProvider`** — sandbox keys, then live keys. Converts integer
+  centavos to Maya's decimal pesos at this boundary and nowhere else.
 
 This is what makes "mock mode first" a design property rather than a
 temporary hack.
@@ -756,7 +778,7 @@ no URL at all.
 | **Admin — setup** | `venues` · `courts` · `courts/{id}/price-rules` · `closures` (bulk range → N slot rows) · `parameters` |
 | **Admin — ops** | `GET /admin/bookings` (venue/court/date/status filters) · `POST /admin/bookings/walk-in` · the three action routes above · `GET /admin/bookings/unfulfilled` |
 | **Admin — staff** | `POST /admin/users` (invite) · `GET /admin/users` · `PATCH /admin/users/{id}` |
-| **Webhook** (unauthenticated) | `POST /webhooks/paymongo` |
+| **Webhook** (unauthenticated) | `POST /webhooks/maya` |
 | **Health** | `GET /health` |
 
 `GET /admin/bookings/unfulfilled` is the resolution queue from §5.5 — the
@@ -765,7 +787,7 @@ those failures stay invisible until a customer complains.
 
 ### 7.5 Raw provider payloads are personal data
 
-`webhook_events.payload` and `payments.raw_payload` hold PayMongo's raw
+`webhook_events.payload` and `payments.raw_payload` hold Maya's raw
 payloads, which carry payer name, email, and mobile. They are kept because
 disputes and webhook debugging need the original bytes, but they are personal
 data under the Data Privacy Act (RA 10173) and must not accumulate forever.
@@ -779,11 +801,14 @@ data under the Data Privacy Act (RA 10173) and must not accumulate forever.
 
 Each is easy to miss and each breaks delivery silently:
 
-- **No JWT requirement** — PayMongo has no token.
+- **No JWT requirement** — Maya has no token.
 - **No rate limiting** — a retry storm during an incident is exactly when
-  delivery matters most, and a 429 would make it permanent.
-- **Raw request body preserved** for signature verification. Any middleware
-  that parses and re-serializes JSON invalidates the signature.
+  delivery matters most, and Maya gives up after four attempts.
+- **Raw request body preserved**, so the stored payload is the bytes Maya
+  sent. (Maya does not sign webhooks, so this is no longer about a signature.)
+- **Source-IP allowlist** for Maya's published webhook IPs, read from the
+  correct `X-Forwarded-For` hop behind Render. Defence in depth only — the
+  re-fetch is the real control (ADR 0002 §1).
 
 ---
 
@@ -802,7 +827,7 @@ src/app/
 └── (app)/        everything else, JWT required
     ├── venues/              venue list → court list → availability → book
     ├── bookings/            my bookings, detail
-    ├── checkout/return/     PayMongo redirect target
+    ├── checkout/return/     Maya redirect target
     └── staff/               permission-gated console
         └── schedule · bookings · courts · pricing · closures · users · parameters
 ```
@@ -854,9 +879,11 @@ back, which reads as a bug. Tap → server → *then* held.
 
 **The hold needs a visible countdown.** The player has 15 minutes and no way to
 know unless told. A timer on the checkout screen, and an honest expiry state
-when it lapses — never a silent failure at PayMongo.
+when it lapses — never a silent failure at Maya. Because a Maya checkout
+outlives the hold (ADR 0002 §2), the lapsed state must say plainly that paying
+now may not secure the court.
 
-**The return page polls; it does not trust the redirect.** PayMongo bounces the
+**The return page polls; it does not trust the redirect.** Maya bounces the
 player back, but the webhook may not have landed — it often arrives *before*
 the redirect, sometimes seconds after. The return page shows "confirming your
 booking", polls `GET /bookings/me/{id}` briefly, then declares success or
@@ -915,7 +942,7 @@ failure looks like a database problem and is not.
 
 Render's free tier sleeps after 15 idle minutes and cold-starts in ~50 s — and
 that lands **squarely on the payment confirmation path**. A sleeping backend
-means PayMongo's webhook times out and retries while the player watches the
+means Maya's webhook times out and retries while the player watches the
 return page spin. It resolves correctly, because retries and polling both
 work, but it feels broken.
 
@@ -942,13 +969,15 @@ difference between a 2-second confirmation and a 50-second one.
 
 ### 9.5 Secrets, CI, and phasing
 
-`PAYMONGO_SECRET_KEY` and `PAYMONGO_WEBHOOK_SECRET` are **server-only** —
-never `NEXT_PUBLIC_*`, which is compiled into the browser bundle. The frontend
-holds only `NEXT_PUBLIC_API_BASE_URL`.
+`MAYA_PUBLIC_KEY` and `MAYA_SECRET_KEY` are **server-only** — never
+`NEXT_PUBLIC_*`, which is compiled into the browser bundle. "Public" is Maya's
+name for the checkout key, but checkouts are created by the backend, so it
+stays there too. Maya has no webhook secret. The frontend holds only
+`NEXT_PUBLIC_API_BASE_URL`.
 
-Rollout follows the provider port: **mock → PayMongo test → live**. The mock
+Rollout follows the provider port: **mock → Maya sandbox → live**. The mock
 adapter pays off immediately in development, where webhooks need no ngrok
-tunnel because the mock posts a correctly-signed one to itself.
+tunnel because the mock posts one to itself.
 
 CI per repo via GitHub Actions: backend `ruff` + `mypy` + `pytest`; frontend
 `eslint` + `tsc` + `build`.
@@ -959,10 +988,11 @@ CI per repo via GitHub Actions: backend `ruff` + `mypy` + `pytest`; frontend
 
 - **BIR official receipts.** PH businesses are legally required to issue them.
   Assumed handled outside this system — recorded as a decision, not a surprise.
-- **PayMongo live-mode onboarding** requires a registered PH business (DTI/SEC
-  + BIR). Test mode needs no paperwork. This is the long pole on the schedule
+- **Maya live-mode onboarding** requires a registered PH business (DTI/SEC
+  + BIR). The sandbox needs no paperwork. Ask for QR Ph (GCash) and void/refund
+  to be enabled during onboarding (ADR 0002). This is the long pole on the schedule
   and should start in parallel with development.
 - **Free-tier behaviour:** Supabase pauses a project after ~7 days idle;
   Render free cold-starts in ~50s. Accepted. Neither breaks correctness —
-  PayMongo retries webhooks — but a mid-payment spinner is poor UX. ~$7/mo on
+  Maya retries webhooks — but a mid-payment spinner is poor UX. ~$7/mo on
   Render removes it when it matters.
