@@ -25,7 +25,7 @@ its own `origin` and its own `main`.
 | Repo | GitHub | State |
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
-| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 4 complete |
+| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 5 on mock Maya |
 | `pikol-frontend` | not created | Phase 6 |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
@@ -33,12 +33,13 @@ the frontend tree.
 
 ## Current state
 
-**Phases 1–4 are complete** — foundation; identity and auth; venues, courts,
-and pricing; and the booking core: the availability grid, 15-minute holds
-with lazy expiry, walk-ins, staff actions, and closures. The first
-`SUPER_ADMIN` comes from `uv run python -m src.users.cli
-create-super-admin`. Phase 5 (payments, on **Maya** — ADR 0002) is next;
-until then a hold simply expires.
+**Phases 1–4 are complete, and Phase 5 runs end to end on a mock Maya** —
+foundation; identity and auth; venues, courts, and pricing; the booking core
+(grid, holds, walk-ins, closures); and payments: checkout on every hold, an
+untrusted-webhook-then-re-fetch confirmation path, late-payment
+re-acquisition, a resolution queue, and receipts. The real `MayaProvider`
+adapter is the one Phase 5 piece left; it needs Maya sandbox keys. The first
+`SUPER_ADMIN` comes from `uv run python -m src.users.cli create-super-admin`.
 
 The roadmap and its phase order live in
 [`docs/plans/2026-09-09-implementation-roadmap.md`](docs/plans/2026-09-09-implementation-roadmap.md).
@@ -235,6 +236,8 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
   — Phase 3, task by task. Complete.
 - [`docs/plans/2026-10-21-phase-4-booking-core.md`](docs/plans/2026-10-21-phase-4-booking-core.md)
   — Phase 4, task by task. Complete.
+- [`docs/plans/2026-10-21-phase-5-payments-mock.md`](docs/plans/2026-10-21-phase-5-payments-mock.md)
+  — Phase 5 on the mock provider. Complete; the Maya adapter follows.
 - [`docs/adr/pikol.dbml`](docs/adr/pikol.dbml) — the schema, plus Appendix A
   (DDL the diagram cannot express) and Appendix B (seed data).
 - [`docs/adr/0001-booking-slot-uniqueness.md`](docs/adr/0001-booking-slot-uniqueness.md)
