@@ -26,7 +26,7 @@ its own `origin` and its own `main`.
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
 | `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 5 on mock Maya |
-| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | Phase 6 complete |
+| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | Phase 7 complete |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
 the frontend tree.
@@ -34,14 +34,15 @@ the frontend tree.
 ## Current state
 
 **Phases 1–4 are complete, Phase 5 runs end to end on a mock Maya, and
-Phase 6 (frontend foundation) is complete.** The backend covers identity,
-venues and pricing, the booking core, and payments (checkout, untrusted
-webhook + re-fetch, late-payment re-acquisition, resolution queue,
-receipts). The frontend has the Next.js scaffold, the API client with
-single-flight refresh, and every sign-in/registration/recovery screen;
-`/venues` and `/staff` are placeholders. **Next: Phase 7, the player
-booking flow.** The real `MayaProvider` is deferred until sandbox keys
-exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
+Phases 6–7 (frontend foundation and the player booking flow) are complete.**
+The backend covers identity, venues and pricing, the booking core, and
+payments (checkout, untrusted webhook + re-fetch, late-payment
+re-acquisition, resolution queue, receipts). The frontend has every
+sign-in/registration/recovery screen and the full player flow: venues, the
+day grid, holds with a countdown, the pay page, the checkout return, and My
+Bookings; `/staff` is a placeholder. **Next: Phase 8, the staff console.**
+The real `MayaProvider` is deferred until sandbox keys exist. The first
+`SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.
 
 The roadmap and its phase order live in
@@ -243,6 +244,8 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
   — Phase 5 on the mock provider. Complete; the Maya adapter follows.
 - [`docs/plans/2026-10-21-phase-6-frontend-foundation.md`](docs/plans/2026-10-21-phase-6-frontend-foundation.md)
   — Phase 6, the frontend foundation and auth screens. Complete.
+- [`docs/plans/2026-10-22-phase-7-player-booking-flow.md`](docs/plans/2026-10-22-phase-7-player-booking-flow.md)
+  — Phase 7, the player booking flow. Complete.
 - [`docs/adr/pikol.dbml`](docs/adr/pikol.dbml) — the schema, plus Appendix A
   (DDL the diagram cannot express) and Appendix B (seed data).
 - [`docs/adr/0001-booking-slot-uniqueness.md`](docs/adr/0001-booking-slot-uniqueness.md)
