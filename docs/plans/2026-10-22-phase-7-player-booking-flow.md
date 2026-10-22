@@ -37,6 +37,7 @@ Everything in Phase 6, plus:
 - **Money is integer centavos** until `formatPeso`. Fees and totals come from the server. The client sums only grid cell prices, for a labelled subtotal.
 - Branch on error `code`, render `detail`: `SLOT_UNAVAILABLE`, `HOLD_LIMIT`, `TOO_SOON`, `BEYOND_HORIZON`, `NOT_ON_THE_HOUR`, `PAYMENT_PROVIDER_UNAVAILABLE`, `HOLD_NOT_LIVE`, `NOT_CANCELLABLE`, `CANCELLATION_CUTOFF_PASSED`, `NOT_FOUND`.
 - Query keys only from each slice's `keys.ts`. Cross-slice imports go through the barrel.
+- **Signing out clears the whole query cache — bookings are per-user.** `AuthProvider` calls `queryClient.clear()`, not just `removeQueries(authKeys.all)`.
 
 ## Decisions this plan makes
 
@@ -51,7 +52,7 @@ Everything in Phase 6, plus:
 | Pay uses the `checkout_url` from the create response, cached under `bookingKeys.checkout(id)`. If none is cached (after a reload, or after `payment_status = FAILED`), it calls `POST /bookings/me/{id}/checkout` | One checkout per hold in the common path. The retry route exists for every other path |
 | Countdown runs on the client clock against `expires_at`. At zero it refetches the booking and renders whatever `display_status` the server returns | A skewed clock can only make the timer end early or late. The decision itself stays the server's |
 | Lapsed hold copy: "Your hold has expired. If you already opened the payment page, paying now may not secure this court." Plus **Book again** back to the grid | ADR 0002 §2: a Maya checkout outlives the hold, so the honest state must say so |
-| Return page: poll `GET /bookings/me/{id}` every 2 s for up to 30 s. Call `refresh-payment` at t = 0 s and t = 15 s | Covers a webhook that is late or lost. Two calls per visit stay well inside the 10/min limit |
+| Return page: poll `GET /bookings/me/{id}` every 2 s for up to 30 s. Call `refresh-payment` at t = 0 s and t = 15 s. `FAILED` is provisional inside that window: polling and the 15 s refresh continue, and the page says "Confirming…" until the 15 s refresh has come back (or the window ends) | Covers a webhook that is late or lost. Two calls per visit stay well inside the 10/min limit. The backend keeps a group `FAILED` until a `PAID` payment lands, so a retry that succeeded can return on a stale `FAILED` |
 | `EXPIRED` + `PAID` renders "We received your payment but could not secure the court. Staff will contact you about a refund or a new slot." | That is the `needs_resolution` case. `BookingOut` does not expose the flag, and the two axes already identify it |
 | Online booking UI shows only when `canBookOnline(permissions)` is true, i.e. the user lacks `BOOKING:ReadAny`. Staff see the grid read-only | `POST /bookings` is player-only (403 for staff). This matches `landingPath` and needs no role parsing |
 | Cancel is offered when `display_status ∈ {PENDING, CONFIRMED}` and the booking has not started. A `CONFIRMED`+`PAID` cancel warns "No refund". The cutoff is enforced by the server (`CANCELLATION_CUTOFF_PASSED`) | Players cannot read `cancellation_cutoff_minutes` |
@@ -274,13 +275,15 @@ Everything in Phase 6, plus:
   - `CANCELLED` gives `cancelled`.
   - Anything else gives `pending`.
 - **`useConfirmBooking(id)`**:
-  - `useQuery(bookingKeys.detail(id))` with `refetchInterval` 2000 while the outcome is `pending` and under 30 s have elapsed, otherwise `false`
-  - fires `bookingsApi.refreshPayment(id)` at mount and at 15 s; each result is written into `detail(id)`, and a 429 or other error is ignored and polling continues
+  - `useQuery(bookingKeys.detail(id))` with `refetchInterval` 2000 while the server's outcome is `pending` **or `failed`** and under 30 s have elapsed, otherwise `false`
+  - fires `bookingsApi.refreshPayment(id)` at mount and at 15 s (the 15 s call also fires for `failed`); each result is written into `detail(id)`, and a 429 or other error is ignored and polling continues
+  - `failed` is provisional: the returned `outcome` is `pending` until the 15 s refresh has returned (success or error) or 30 s have elapsed, then `failed`
+  - `timedOut` is true only for a booking still `pending` at 30 s; a still-`FAILED` one shows the failure copy
   - returns `{ booking, outcome, timedOut }`
 - **`<CheckoutReturn bookingId />`** renders by outcome:
   - `pending` shows "Confirming your booking…" with a spinner.
   - `confirmed` shows "You're booked", the reference code, court and time, and a link to the booking.
-  - `failed` shows "Payment didn't go through" + **Try again** linking to `/bookings/{id}`.
+  - `failed` (only after the 15 s refresh has returned, or the window has ended) shows "Payment didn't go through" + **Try again** linking to `/bookings/{id}`.
   - `unhoused` shows the unhoused copy.
   - `lapsed` shows the lapsed copy.
   - `timedOut` + `pending` shows "We're still waiting for the payment provider. Your booking will update in My Bookings." with a link, and never a success state.
@@ -292,7 +295,8 @@ Everything in Phase 6, plus:
   - The return page sees PENDING → PENDING → (the t = 15 s refresh returns CONFIRMED/PAID) → success, and `refreshPayment` is called exactly twice.
   - Webhook already landed: the first GET is CONFIRMED/PAID, so success shows immediately and polling stops.
   - Always PENDING for 30 s shows the timeout copy and **no** "You're booked".
-  - `FAILED` shows Try again.
+  - Always `FAILED` shows Try again, but only after the t = 15 s refresh returns.
+  - `FAILED`, the mount refresh errors, and the t = 15 s refresh returns CONFIRMED/PAID: ends on "You're booked" and never shows "Payment didn't go through" in between.
   - `?booking_id=abc` shows not-found without any request.
   - The query string alone (`?booking_id=7&status=success`) never renders success while the server says PENDING.
 - [ ] **Step 2:** `npm test -- return-outcome checkout-return`. Expected: FAIL.
