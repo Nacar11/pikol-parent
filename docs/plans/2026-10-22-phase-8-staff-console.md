@@ -369,10 +369,11 @@ Everything in Phase 7, plus:
 **Interfaces:**
 - **Closures API.**
   - `POST /admin/closures {court_ids, starts_at, ends_at, reason}` → `AdminBooking[]`
-  - The list is `adminBookingsApi.list({venue_id, type: 'MAINTENANCE', booking_status: 'CONFIRMED', limit: 200})`, filtered to `Date.parse(ends_at) > Date.now()` and sorted by `starts_at`.
+  - The list is `adminBookingsApi.list({venue_id, type: 'MAINTENANCE', booking_status: 'CONFIRMED', ends_after: <now ISO>, limit: 200})`, still filtered to `Date.parse(ends_at) > Date.now()` as a guard and sorted by `starts_at`.
+  - `ends_after` is a backend filter on `GET /admin/bookings` (a slot with `starts_at > ends_after − 1h`). Without it the list is ordered by first slot ascending, so `limit: 200` returns the **oldest** 200 closures and, once a venue passes 200, the upcoming ones are never fetched. *(Amended after the final review.)*
   - Reopen is `adminBookingsApi.reopenClosure(id, reason)`.
 - **`<ClosureForm venueId />`** has:
-  - court checkboxes from the catalog courts, with a **Select all** toggle
+  - court checkboxes from the catalog courts (`useCourts(venueId)` → `GET /venues/{id}/courts` in the catalog slice — **not** the admin courts list, which needs `COURT:Manage` that `VENUE_STAFF` lack), with a **Select all** toggle
   - a start day and hour, and an end day and hour, each as a Manila `<input type=date>` plus an hour select
   - a reason
 - Submit posts `manilaInstant(startDay, startHour)` → `manilaInstant(endDay, endHour)`.
@@ -391,6 +392,8 @@ Everything in Phase 7, plus:
   - End before start is blocked client-side.
   - A 409 shows the "Nothing was closed" copy.
   - The list hides ended closures.
+  - With staff-only permissions (`CLOSURE:Manage`, no `COURT:Manage`) the court checkboxes render from the catalog and a closure posts. *(Added after the final review: mocks that ignore permissions let the admin-courts 403 through.)*
+  - The default range starts at the next Manila hour, so an untouched form never trips `IN_THE_PAST`.
   - Reopen requires a reason and posts to `/admin/closures/{id}/cancel`.
 - [ ] **Step 2:** `npm test -- closures`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
