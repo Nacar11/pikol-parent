@@ -25,7 +25,7 @@ its own `origin` and its own `main`.
 | Repo | GitHub | State |
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
-| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 5 on mock Maya |
+| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 8 on mock Maya |
 | `pikol-frontend` | `Nacar11/pikol-frontend` (public) | Phase 8 complete |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
