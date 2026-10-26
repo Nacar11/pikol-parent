@@ -24,7 +24,7 @@ Project pikol {
   database_type: 'PostgreSQL'
   Note: '''
   Single owner → many venues → many courts. Courts sell clock-aligned
-  one-hour slots, 24/7. Registered players book and pay online via Maya;
+  one-hour slots, 24/7. Customers book and pay online via Maya (mobile app);
   staff book walk-ins and collect cash. Both paths write the same tables and
   pass the same uniqueness constraint.
 
@@ -41,9 +41,10 @@ Project pikol {
 
 TableGroup identity [note: 'Who is asking, and what may they do'] {
   users
-  roles
+  user_groups
+  user_group_members
+  user_group_permissions
   permissions
-  role_permissions
   refresh_tokens
   user_tokens
 }
@@ -136,17 +137,70 @@ Enum parameter_value_type {
   string
 }
 
-// ═══════════════════════════ IDENTITY ═══════════════════════════
-// Recycled from asima (users / roles / permissions / refresh_tokens),
-// with venue scoping and email verification added.
+Enum group_kind {
+  CUSTOMER [note: 'Exactly one, no venue. Membership IS the right to book and pay as yourself (the mobile app). Holds no permission codes']
+  MASTER   [note: 'One per venue — its venue masters. Only the super admin edits it']
+  STAFF    [note: 'Any number per venue. Managed by the super admin or that venue’s masters']
+}
 
-Table roles {
-  id          integer      [pk, increment]
-  code        varchar(32)  [not null, unique, note: 'SUPER_ADMIN | VENUE_MANAGER | VENUE_STAFF | PLAYER']
-  name        varchar(64)  [not null]
-  description varchar(255)
-  created_at  timestamptz  [not null, default: `now()`]
-  updated_at  timestamptz  [not null, default: `now()`]
+// ═══════════════════════════ IDENTITY ═══════════════════════════
+// Recycled from asima (users / permissions / refresh_tokens), with email
+// verification added. Fixed roles were replaced by venue-owned user groups
+// in 2026-10 — see ADR 0003. There is no `roles` table.
+
+Table user_groups [note: '⚠️ its CHECK and three partial unique indexes are in Appendix A'] {
+  id                 integer      [pk, increment]
+  kind               group_kind   [not null]
+  venue_id           integer      [null, note: 'NULL exactly when kind = CUSTOMER (Appendix A). Fixed by the SERVER from the active venue — never read from a non-admin body']
+  name               varchar(64)  [not null, note: 'Unique per venue on LOWER(name) — Appendix A']
+  created_at         timestamptz  [not null, default: `now()`]
+  updated_at         timestamptz  [not null, default: `now()`]
+  created_by_user_id integer      [null]
+  updated_by_user_id integer      [null]
+
+  indexes {
+    venue_id
+  }
+
+  Note: '''
+  Every venue is created with a MASTER group ("Venue master") and a STAFF
+  group ("Front desk") in the same transaction. Seeds in Appendix B.
+
+  Permissions are evaluated PER VENUE: a request names its venue in
+  X-Venue-ID and the caller holds the union of their groups AT THAT VENUE
+  only. Never the union across venues — ADR 0003.
+
+  VENUE:Manage and PARAMETER:Manage are owner-only and may never be granted
+  to any group, by anyone. That rule spans a join, so the service enforces
+  it, not a constraint.
+  '''
+}
+
+Table user_group_permissions {
+  group_id      integer [not null]
+  permission_id integer [not null]
+
+  indexes {
+    (group_id, permission_id) [pk]
+    permission_id
+  }
+  Note: 'system_admin bypasses this table entirely — see users.system_admin. A CUSTOMER group has no rows here.'
+}
+
+Table user_group_members {
+  group_id         integer     [not null]
+  user_id          integer     [not null]
+  added_by_user_id integer     [null]
+  created_at       timestamptz [not null, default: `now()`]
+
+  indexes {
+    (group_id, user_id) [pk]
+    user_id
+  }
+  Note: '''
+  One person may be in many groups, across venues, and in CUSTOMER as well
+  as staff groups — the two axes are independent.
+  '''
 }
 
 Table permissions {
@@ -163,17 +217,6 @@ Table permissions {
   }
 }
 
-Table role_permissions {
-  role_id       integer [not null]
-  permission_id integer [not null]
-
-  indexes {
-    (role_id, permission_id) [pk]
-    permission_id
-  }
-  Note: 'system_admin bypasses this table entirely — see users.system_admin.'
-}
-
 Table users [note: '⚠️ email uniqueness is in Appendix A, not on the column'] {
   id                integer      [pk, increment]
   email             varchar(255) [not null]
@@ -181,9 +224,7 @@ Table users [note: '⚠️ email uniqueness is in Appendix A, not on the column'
   first_name        varchar(100) [not null]
   last_name         varchar(100) [not null]
   mobile            varchar(32)
-  role_id           integer      [not null]
-  venue_id          integer      [null, note: 'NULL for SUPER_ADMIN and PLAYER. The entire basis of VenueScope']
-  system_admin      boolean      [not null, default: false, note: 'Unconditional bypass axis, ORTHOGONAL to role — asima ADR 0001. The guard short-circuits on this']
+  system_admin      boolean      [not null, default: false, note: 'Unconditional bypass axis, ORTHOGONAL to group membership — asima ADR 0001. The guard short-circuits on this. Never a group']
   is_active         boolean      [not null, default: false, note: 'False until verification or invitation acceptance']
   email_verified_at timestamptz  [null]
   last_login_at     timestamptz  [null]
@@ -192,13 +233,13 @@ Table users [note: '⚠️ email uniqueness is in Appendix A, not on the column'
   deleted_at        timestamptz  [null, note: 'Soft delete. A deleted user must not block email re-use — see Appendix A']
 
   indexes {
-    role_id
-    venue_id
     is_active
   }
 
   Note: '''
-  A player is simply role = PLAYER, not a separate identity system.
+  Who someone is lives here; what they may do lives in user_group_members.
+  A customer is a member of the CUSTOMER group; staff at venue V are members
+  of V's MASTER or STAFF groups; one account may be both (ADR 0003).
 
   ⚠️ There is deliberately NO unique constraint on the email column. Appendix
   A declares a partial functional index on LOWER(email) WHERE deleted_at IS
@@ -206,11 +247,11 @@ Table users [note: '⚠️ email uniqueness is in Appendix A, not on the column'
   different people, and would permanently block re-registering an address
   after a soft delete. (Recycled from asima.)
 
-  PRIVILEGE ESCALATION — the manager-facing create endpoint must FIX
-  role_id to VENUE_STAFF and take venue_id from the CREATOR TOKEN, never the
-  request body. Reading either from input lets a venue manager mint a
-  SUPER_ADMIN, or issue themselves a valid credential at another venue that
-  passes every VenueScope check while looking entirely normal in the logs.
+  PRIVILEGE ESCALATION — a non-owner may only place people in STAFF groups
+  of the ACTIVE venue, and the server — never the request body — decides a
+  new group's venue and kind. Reading either from input lets a venue master
+  mint another master, or a credential at another venue that passes every
+  VenueScope check while looking entirely normal in the logs.
   '''
 }
 
@@ -496,10 +537,14 @@ Table parameters {
 
 // ═══════════════════════════ RELATIONSHIPS ═══════════════════════════
 
-Ref: users.role_id > roles.id [delete: restrict]
-Ref: users.venue_id > venues.id [delete: restrict]
-Ref: role_permissions.role_id > roles.id [delete: cascade]
-Ref: role_permissions.permission_id > permissions.id [delete: cascade]
+Ref: user_groups.venue_id > venues.id [delete: restrict]
+Ref: user_groups.created_by_user_id > users.id
+Ref: user_groups.updated_by_user_id > users.id
+Ref: user_group_permissions.group_id > user_groups.id [delete: cascade]
+Ref: user_group_permissions.permission_id > permissions.id [delete: cascade]
+Ref: user_group_members.group_id > user_groups.id [delete: cascade]
+Ref: user_group_members.user_id > users.id [delete: cascade]
+Ref: user_group_members.added_by_user_id > users.id
 Ref: refresh_tokens.user_id > users.id [delete: cascade]
 Ref: user_tokens.user_id > users.id [delete: cascade]
 
@@ -595,30 +640,52 @@ Ref: parameters.updated_by_user_id > users.id
    --      starts_at >= (:date::timestamp AT TIME ZONE 'Asia/Manila')
    --      AND starts_at < ((:date::timestamp + interval '1 day') AT TIME ZONE 'Asia/Manila')
 
+   -- 10. USER_GROUPS: only the customer group is venue-less.
+   ALTER TABLE user_groups
+     ADD CONSTRAINT ck_group_venue_matches_kind
+     CHECK ((kind = 'CUSTOMER') = (venue_id IS NULL));
+
+   -- 11. USER_GROUPS: exactly one customer group in the whole system.
+   CREATE UNIQUE INDEX uq_user_groups_one_customer
+       ON user_groups (kind)
+    WHERE kind = 'CUSTOMER';
+
+   -- 12. USER_GROUPS: one master group per venue. Without it, a second
+   --     MASTER row is a second set of owner-granted powers nobody chose.
+   CREATE UNIQUE INDEX uq_user_groups_one_master_per_venue
+       ON user_groups (venue_id)
+    WHERE kind = 'MASTER';
+
+   -- 13. USER_GROUPS: names unique per venue, case-insensitively.
+   CREATE UNIQUE INDEX uq_user_groups_venue_name
+       ON user_groups (venue_id, LOWER(name))
+    WHERE venue_id IS NOT NULL;
+
    ═══════════════════════════════════════════════════════════════════════════
    APPENDIX B — SEED DATA
    ═══════════════════════════════════════════════════════════════════════════
-
-   -- ROLES
-   --   SUPER_ADMIN    All venues. The owner. Also carries users.system_admin = true.
-   --   VENUE_MANAGER  One venue. May invite VENUE_STAFF for that venue only.
-   --   VENUE_STAFF    One venue. Counter operations.
-   --   PLAYER         Self-service only.
 
    -- PERMISSIONS (code = resource:action)
    --   VENUE:Manage · COURT:Manage · PRICE:Manage · CLOSURE:Manage
    --   BOOKING:ReadAny · BOOKING:CreateWalkIn · BOOKING:MarkPaid
    --   BOOKING:SetOutcome · BOOKING:CancelAny
    --   USER:Manage · PARAMETER:Manage
+   --   OWNER-ONLY, never on any group: VENUE:Manage, PARAMETER:Manage
 
-   -- ROLE_PERMISSIONS
-   --   VENUE_MANAGER  COURT:Manage, PRICE:Manage, CLOSURE:Manage,
-   --                  BOOKING:*, USER:Manage (restricted to VENUE_STAFF at
-   --                  their own venue by the endpoint, not by this table)
-   --   VENUE_STAFF    CLOSURE:Manage, BOOKING:ReadAny, BOOKING:CreateWalkIn,
-   --                  BOOKING:MarkPaid, BOOKING:SetOutcome, BOOKING:CancelAny
-   --   PLAYER         none
-   --   SUPER_ADMIN    none needed — users.system_admin short-circuits the guard
+   -- USER_GROUPS
+   --   Once, at install:
+   --     "Customer"      CUSTOMER  venue NULL  no permissions
+   --   Per venue, created WITH the venue in one transaction:
+   --     "Venue master"  MASTER    COURT:Manage, PRICE:Manage, CLOSURE:Manage,
+   --                               BOOKING:*, USER:Manage
+   --     "Front desk"    STAFF     CLOSURE:Manage, BOOKING:ReadAny,
+   --                               BOOKING:CreateWalkIn, BOOKING:MarkPaid,
+   --                               BOOKING:SetOutcome, BOOKING:CancelAny
+   --   The owner is not a group: users.system_admin short-circuits the guard.
+
+   -- BACKFILL from the retired roles (migration 0006):
+   --   PLAYER → Customer · VENUE_MANAGER → that venue's Venue master
+   --   VENUE_STAFF → that venue's Front desk · SUPER_ADMIN → no group
 
    -- PARAMETERS  key | value | type | note
    --   default_slot_price_centavos    | 50000 | int     | PHP 500.00 fallback

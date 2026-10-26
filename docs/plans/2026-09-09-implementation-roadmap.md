@@ -34,6 +34,16 @@ single plan at TDD granularity would be several thousand lines and unusable.
 | 8 | **Frontend staff console** | Today's schedule, walk-in booking, mark-paid, outcomes, courts/pricing/closures, staff invites, parameters | §8 |
 | 9 | **Deployment** | Supabase + Render + Vercel live, keep-alive, CI/CD, Maya sandbox → live | §9 |
 
+**Inserted before Phase 9 (2026-10-27): user groups and the staff-only web.**
+Fixed roles become venue-owned user groups with a built-in Customer group,
+permissions apply per active venue, the web becomes staff-only (customers
+move to a future mobile app), and the console gets the sidebar shell and
+the new Schedule layout. It lands before deployment because it changes the
+identity model Phase 9 would ship. Design and plan:
+[`2026-10-27-user-groups-and-console-redesign-design.md`](./2026-10-27-user-groups-and-console-redesign-design.md),
+[`2026-10-27-user-groups-and-console-redesign.md`](./2026-10-27-user-groups-and-console-redesign.md);
+decision record: [ADR 0003](../adr/0003-venue-user-groups.md).
+
 ## Why this order
 
 **Phase 4 depends on 3, not the reverse.** Bookings need courts and prices to
