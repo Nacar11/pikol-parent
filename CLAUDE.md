@@ -42,7 +42,9 @@ console only — customers will use a mobile app, so the web player pages were
 removed and the backend's customer routes stay for that app. The console is
 black and white in an asima-style sidebar, with the new Schedule layout,
 Setup → Venue staff for a venue's masters, and Masters → User groups for the
-owner. **Next: Phase 9, deployment.** Until the mobile app ships, customers
+owner. A cleanup pass (2026-10-27, [`docs/standard/cleanup-pass.md`](docs/standard/cleanup-pass.md))
+added a real-stack Playwright suite (`npm run e2e`), dead-code checks in both
+repos and shared console components. **Next: Phase 9, deployment.** Until the mobile app ships, customers
 cannot book online. The real `MayaProvider` is deferred until sandbox keys
 exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.

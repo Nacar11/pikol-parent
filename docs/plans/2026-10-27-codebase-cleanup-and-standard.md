@@ -263,4 +263,25 @@ def test_accepts_an_e2e_database() -> None:
 
 ## Results
 
-(filled in by Task 13)
+| Metric | Frontend before → after | Backend before → after |
+|---|---|---|
+| `src` lines | 9,551 → 9,336 | 8,031 → 8,210 (+ summaries slice and e2e seed) |
+| test lines | 4,582 unit → 4,619 unit + 243 e2e | 5,867 → 6,043 |
+| dead-code findings | 32 → 0 (knip, normal and `--production`) | 3 → 0 (vulture) |
+| comment lines | 495 → 379 | 234 → 221 |
+| requests on load: Courts / Venues | 1 + 1 + 2/court · 1 + 2/venue → 2 · 2 | — |
+| largest file | Courts 403 → Select 336 | bookings service 444 → 432 |
+| Playwright | none → 12 specs, real stack | — |
+
+Notable changes: shared UI (`SectionLabel`, `StatStrip`, `AddTile`, `Pill`,
+`Avatar`, `Skeleton`, `VenueRequired`, `buttonVariants`, `setup-card`); two
+summary reads; dead player-flow code removed (`navigate.ts`,
+`formatCountdown`, checkout types, `can_confirm_online_payment`,
+`get_row`); `lib/storage.ts`; `BookingService._cancel`; route sizes 164–194 kB
+First Load JS with no outlier, so no route split.
+
+Left for the next pass: venue switch does not write `?venue=` to the URL in
+the production build (found by e2e, pre-existing); the reviewer's deferred
+minors (keyed Fragment in `VenueRequired`, summary tests' clock, 100-row
+caps, the `javascript:` URL guard the mobile app will need, the e2e
+sign-out case).
