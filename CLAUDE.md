@@ -26,8 +26,8 @@ its own `origin` and its own `main`.
 | Repo | GitHub | State |
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
-| `pikol-backend` | `Nacar11/pikol-backend` (public) | user groups done, mock Maya |
-| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | staff console, staff only |
+| `pikol-backend` | `Nacar11/pikol-backend` (public) | checkouts and refunds done, mock Maya |
+| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | staff console + customer booking demo |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
 the frontend tree.
@@ -37,16 +37,19 @@ the frontend tree.
 **Phases 1–8 are complete, plus the user-groups and console-redesign work
 inserted before Phase 9** (ADR 0003). Fixed roles are gone: permissions come
 from venue-owned user groups, evaluated per active venue, and a built-in
-Customer group is what lets an account book as itself. The web is the staff
-console only — customers will use a mobile app, so the web player pages were
-removed and the backend's customer routes stay for that app. The console is
+Customer group is what lets an account book as itself. The console is
 black and white in an asima-style sidebar, with the new Schedule layout,
 Setup → Venue staff for a venue's masters, and Masters → User groups for the
 owner. A cleanup pass (2026-10-27, [`docs/standard/cleanup-pass.md`](docs/standard/cleanup-pass.md))
 added a real-stack Playwright suite (`npm run e2e`), dead-code checks in both
-repos and shared console components. **Next: Phase 9, deployment.** Until the mobile app ships, customers
-cannot book online. The real `MayaProvider` is deferred until sandbox keys
-exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
+repos and shared console components. The **customer booking demo**
+(2026-10-28, ADR 0004, [its plan](docs/plans/2026-10-28-customer-booking-demo.md))
+puts the mobile app's flow on the web under `/book`, on the same
+`/checkouts/me` API the app will use: pick hours on any courts of one venue,
+a 5-minute hold, Maya (mock), five payment statuses, late payments voided or
+refunded. Demo customers come from `uv run python -m src.devtools.demo_seed
+--customers 3`. **Next: Phase 9, deployment.** The real `MayaProvider` —
+including `void`/`refund` — is deferred until sandbox keys exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.
 
 The roadmap and its phase order live in
@@ -59,12 +62,24 @@ not a live system.
 The vocabulary below is **load-bearing**. Frontend and backend must use the
 same words for the same things.
 
-### A booking group is the unit; slots are the occupancy
+### A booking group is the unit of occupancy; a checkout is the unit of payment
 
 A multi-hour session is **one `booking_groups` row with N `booking_slots`
-rows** — one payment, one cancellation unit. Booking two courts for the same
-hour is two groups. `booking_groups.court_id` is authoritative: a group is
-exactly one court.
+rows**. Booking two courts for the same hour is two groups.
+`booking_groups.court_id` is authoritative: a group is exactly one court.
+
+A customer's **"Pay now" is one `checkouts` row** (ADR 0004): one venue, one
+Maya attempt, one hold deadline, and every group picked together — any
+courts, any days. Its groups share its `expires_at` and are held, released
+and confirmed together; creating it is all-or-nothing. Walk-ins and closures
+have no checkout.
+
+**Five payment statuses**, what the customer sees (`checkouts.status`):
+`PENDING · SUCCESSFUL · FAILED · CANCELLED · REFUNDED`. A failed or
+backed-out payment frees its hours at once; **paid bookings are final**; a
+payment that lands after the hold ended is booked if every hour is still
+free, otherwise voided (same Manila day) or refunded in full, never half
+booked. The PENDING trap applies to checkouts too.
 
 ### Two status axes, not one
 
@@ -77,9 +92,10 @@ payment_status    UNPAID · PAID · FAILED
 - **Walk-in:** `CONFIRMED/UNPAID` → staff collects → `CONFIRMED/PAID`
 
 One column cannot express a staff-created walk-in that blocks its slot before
-money changes hands. `booking_groups.payment_status` is **authoritative** —
-it is what guards read and what the UI shows. `payments.status` tracks one
-provider attempt, and a group may accumulate several when a player retries.
+money changes hands. `booking_groups.payment_status` is **authoritative** for
+a group — it is what guards read and what the console shows. For online
+money the verdict is `checkouts.status`; `payments.status` tracks the one
+provider attempt, and Maya's own wording sits beside it in `provider_status`.
 
 `IN_PROGRESS` is **derived, never stored**: `CONFIRMED ∧ now ∈ [starts_at,
 starts_at + 1h)`. A stored value drifts between cron ticks; a derived one is
@@ -293,6 +309,13 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
 - [`docs/adr/0003-venue-user-groups.md`](docs/adr/0003-venue-user-groups.md)
   — venue-owned user groups replace roles; Customer is a group; permissions
   are per active venue. Read before touching auth, users or groups.
+- [`docs/adr/0004-online-payment-flow-and-statuses.md`](docs/adr/0004-online-payment-flow-and-statuses.md)
+  — the 5-minute hold, no cart, one venue per payment, the five statuses,
+  void/refund of late payments, and the 17 test scenarios. Read before
+  touching checkouts or payments.
+- [`docs/plans/2026-10-27-customer-booking-demo-design.md`](docs/plans/2026-10-27-customer-booking-demo-design.md)
+  and [its plan](docs/plans/2026-10-28-customer-booking-demo.md) — the web
+  booking demo, checkouts and favorites. Complete.
 - [`docs/standard/`](docs/standard/) — repeatable procedures. Run
   [`cleanup-pass.md`](docs/standard/cleanup-pass.md) after a feature push to
   shrink, share and test the code without changing behaviour.
@@ -353,6 +376,8 @@ Rollout follows the provider port: **mock → Maya sandbox → live**.
 - When a plan's own code fails a lint or type gate, fix **both** the code and
   the plan. The plan is copied by later phases; a defect left in it is a
   defect re-introduced four more times.
+- For unfamiliar features, don't write from scratch — first search GitHub for
+  open-source projects, compare approaches, then get started.
 
 ## Git workflow
 
