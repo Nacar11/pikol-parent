@@ -527,7 +527,7 @@ Table checkouts [note: '⚠️ its money CHECK is in Appendix A'] {
   '''
 }
 
-Table payments {
+Table payments [note: '⚠️ one open attempt per checkout — partial unique index in Appendix A'] {
   id                   integer          [pk, increment]
   checkout_id          integer          [not null]
   provider             payment_provider [not null]
@@ -748,6 +748,15 @@ Ref: parameters.updated_by_user_id > users.id
    ALTER TABLE booking_groups
      ADD CONSTRAINT ck_checkout_only_on_player_booking
      CHECK ((type = 'PLAYER_BOOKING') = (checkout_id IS NOT NULL));
+
+   -- 16. PAYMENTS: at most one OPEN attempt per checkout. Maya cannot close a
+   --     session early, so a second one could also be paid; two concurrent
+   --     "Continue to Maya" requests must not both insert. Partial, because
+   --     checkouts backfilled from the old retry route may hold a resolved
+   --     attempt beside a later one.
+   CREATE UNIQUE INDEX uq_payments_one_open_attempt
+       ON payments (checkout_id)
+    WHERE status = 'PENDING';
 
    ═══════════════════════════════════════════════════════════════════════════
    APPENDIX B — SEED DATA
