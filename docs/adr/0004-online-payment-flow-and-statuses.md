@@ -1,8 +1,8 @@
 # ADR 0004: Online payment flow and statuses
 
 **Date:** 2026-10-27
-**Status:** Proposed — decided with the owner; the customer booking UI that
-uses it is still being designed
+**Status:** Accepted — built in
+[the customer booking demo](../plans/2026-10-28-customer-booking-demo.md)
 **Builds on:** [ADR 0001](0001-booking-slot-uniqueness.md) (one index decides
 occupancy), [ADR 0002](0002-maya-payment-provider.md) (Maya Checkout,
 unsigned webhooks, one-hour sessions)
@@ -156,8 +156,10 @@ Every other final status stays final.
 | Void window | Until 12:00 AM GMT+8 that day | Maya | After it, use a refund |
 | Refund window | 180 days | Maya | After it, Maya's aftersales team, by hand |
 
-`min_lead_minutes` (20) must stay ≥ `hold_duration_minutes` (5), so a hold
-can never outlive the hour it holds.
+`min_lead_minutes` may be lower than `hold_duration_minutes`, down to 0 (the
+owner books 1–2 PM at 12:58 PM), so a hold may run a few minutes into the
+hour it holds. An hour whose start has passed can never be held, and a late
+payment never re-acquires one (design call 1).
 
 ## Test scenarios
 

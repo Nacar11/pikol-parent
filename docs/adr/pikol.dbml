@@ -60,8 +60,10 @@ TableGroup booking [note: 'Occupancy of a court-hour'] {
   booking_slots
 }
 
-TableGroup money [note: 'Provider interaction. booking_groups holds the verdict'] {
+TableGroup money [note: 'One checkout per Pay now; its payment attempt, refund and webhooks'] {
+  checkouts
   payments
+  refunds
   webhook_events
 }
 
@@ -122,12 +124,20 @@ Enum payment_provider {
   MAYA     [note: 'Maya Checkout. Webhooks are unsigned — re-fetch the payment (ADR 0002)']
 }
 
-Enum provider_payment_status {
-  PENDING
-  PAID
-  FAILED
-  EXPIRED
-  CANCELLED [note: 'Maya PAYMENT_CANCELLED — the payer backed out. Distinct from FAILED (ADR 0002)']
+Enum payment_outcome {
+  // The five statuses a customer sees (ADR 0004). Used by checkouts.status
+  // (the verdict) and payments.status (what the one attempt came to).
+  // Maya's own wording, e.g. PAYMENT_EXPIRED, is kept in payments.provider_status.
+  PENDING    [note: 'Hold placed, waiting for Maya. NEVER means live without expires_at > now()']
+  SUCCESSFUL [note: 'Maya confirmed payment and every hour is ours. Final']
+  FAILED     [note: 'Maya declined it. Hold released at once. Final']
+  CANCELLED  [note: 'Backed out, cancelled, or the hold ended first. Can still become SUCCESSFUL or REFUNDED']
+  REFUNDED   [note: 'Paid after the hold ended and an hour was taken: voided or refunded, nothing booked. Final']
+}
+
+Enum refund_kind {
+  VOID   [note: 'Same Manila day as the payment, full amount']
+  REFUND [note: 'From the next day, up to 180 days']
 }
 
 Enum parameter_value_type {
@@ -381,7 +391,8 @@ Table booking_groups {
   fee_centavos         integer        [not null, default: 0, note: 'FROZEN at creation. Always 0 for walk-ins']
   total_centavos       integer        [not null, note: 'What was actually charged. Kept, not derived — this is the money record']
   payment_method       payment_method [null]
-  expires_at           timestamptz    [null, note: 'Hold deadline. Set for PENDING only']
+  checkout_id          integer        [null, note: 'Set exactly for PLAYER_BOOKING — Appendix A §15. The checkout that paid (or tried to pay) for it']
+  expires_at           timestamptz    [null, note: 'Hold deadline. Set for PENDING only. Equals its checkout.expires_at']
   needs_resolution     boolean        [not null, default: false, note: 'Paid but unhousable. Feeds the admin queue']
   notes                text
   created_by_user_id   integer        [not null, note: 'The player for online, the staff member for a walk-in']
@@ -396,6 +407,7 @@ Table booking_groups {
     (court_id, booking_status)
     (booking_status, expires_at) [note: 'Finding lapsed holds']
     needs_resolution             [note: 'Admin resolution queue']
+    checkout_id
   }
 
   Note: '''
@@ -468,23 +480,71 @@ Table booking_slots [note: '⚠️ its unique index is PARTIAL — Appendix A'] 
 
 // ═══════════════════════════ MONEY ═══════════════════════════
 
-Table payments {
-  id                   integer                 [pk, increment]
-  booking_group_id     integer                 [not null]
-  provider             payment_provider        [not null]
-  provider_checkout_id varchar(128)            [not null, unique]
-  provider_payment_id  varchar(128)            [null, note: 'For Maya, equals provider_checkout_id — the checkoutId IS the paymentId']
-  amount_centavos      integer                 [not null]
-  status               provider_payment_status [not null]
-  raw_payload          jsonb                   [null, note: '⚠️ PII — purged after webhook_payload_retention_days. NEVER logged']
-  created_at           timestamptz             [not null, default: `now()`]
-  updated_at           timestamptz             [not null, default: `now()`]
+Table checkouts [note: '⚠️ its money CHECK is in Appendix A'] {
+  id              integer         [pk, increment]
+  reference_code  varchar(12)     [not null, unique, note: 'Sent to Maya as requestReferenceNumber; quoted to the customer']
+  customer_id     integer         [not null]
+  venue_id        integer         [not null, note: 'ONE venue per payment (ADR 0004 decision 2)']
+  status          payment_outcome [not null, note: 'THE verdict the customer sees. One writer: CheckoutRepository.set_status']
+  price_centavos  integer         [not null, note: 'Sum of its groups. FROZEN']
+  fee_centavos    integer         [not null, note: 'Convenience fee on the subtotal, FROZEN; allocated across its groups']
+  total_centavos  integer         [not null, note: 'price + fee — what Maya is asked for']
+  expires_at      timestamptz     [not null, note: 'The hold deadline, kept after the hold ends as its record']
+  created_at      timestamptz     [not null, default: `now()`]
+  updated_at      timestamptz     [not null, default: `now()`]
 
   indexes {
-    booking_group_id
+    (customer_id, status) [note: 'My bookings, and the hold cap count']
+    (status, expires_at)
+  }
+
+  Note: '''
+  ONE per "Pay now". The checkout is the unit of PAYMENT; the booking group
+  stays the unit of OCCUPANCY (one court, ADR 0001). A checkout covering
+  two courts, or two runs of hours on one court, owns several groups, all
+  sharing its expires_at, so they are held and released together.
+
+  ⚠️ THE PENDING TRAP APPLIES HERE TOO. A lapsed hold keeps status PENDING
+  until something writes it (cleanup is lazy). PENDING never means live
+  without `expires_at > now()` — the hold cap counts only live ones, and a
+  lapsed PENDING reads CANCELLED.
+
+  One payment attempt per checkout: a failed or cancelled attempt has
+  already released its hours, and the customer starts again (ADR 0004
+  decision 10).
+  '''
+}
+
+Table payments {
+  id                   integer          [pk, increment]
+  checkout_id          integer          [not null]
+  provider             payment_provider [not null]
+  provider_checkout_id varchar(128)     [not null, unique]
+  provider_payment_id  varchar(128)     [null, note: 'For Maya, equals provider_checkout_id — the checkoutId IS the paymentId']
+  checkout_url         text             [not null, note: 'Where the customer pays. Reused, never re-created: a second session could also be paid']
+  amount_centavos      integer          [not null]
+  status               payment_outcome  [not null, note: 'What this attempt came to. checkouts.status holds the verdict']
+  provider_status      varchar(32)      [null, note: 'Maya own wording, e.g. PAYMENT_EXPIRED']
+  raw_payload          jsonb            [null, note: '⚠️ PII — purged after webhook_payload_retention_days. NEVER logged']
+  created_at           timestamptz      [not null, default: `now()`]
+  updated_at           timestamptz      [not null, default: `now()`]
+
+  indexes {
+    checkout_id
     created_at [note: 'Retention purge scans by age']
   }
-  Note: 'One row per provider ATTEMPT — a group accumulates several when a player retries a failed checkout. booking_groups.payment_status holds the verdict.'
+  Note: 'One row per provider ATTEMPT — today exactly one per checkout, opened by "Continue to Maya".'
+}
+
+Table refunds {
+  id                 integer      [pk, increment]
+  payment_id         integer      [not null, unique, note: 'A payment is undone at most once, always in full']
+  kind               refund_kind  [not null]
+  amount_centavos    integer      [not null]
+  provider_reference varchar(128) [not null, note: 'Maya reference for the void or refund']
+  created_at         timestamptz  [not null, default: `now()`]
+
+  Note: 'The simple refund flow (ADR 0004 decision 7): a payment that landed after its hold ended, when any of its hours had been taken.'
 }
 
 Table webhook_events {
@@ -528,10 +588,9 @@ Table parameters {
 
   Admin-only writes. Ten seeded keys — see APPENDIX B.
 
-  min_lead_minutes MUST be >= hold_duration_minutes, enforced by a
-  cross-field validator in the application. Below that threshold a hold can
-  outlive the slot it holds, and the webhook confirms a session that already
-  started.
+  min_lead_minutes may be 0 (book 1-2 PM at 12:58 PM), so a hold may run a
+  few minutes into the hour it holds. An hour whose start has passed can
+  never be held or re-acquired (ADR 0004).
   '''
 }
 
@@ -564,7 +623,11 @@ Ref: booking_groups.cancelled_by_user_id > users.id
 Ref: booking_slots.booking_group_id > booking_groups.id [delete: cascade]
 Ref: booking_slots.court_id > courts.id [delete: restrict]
 
-Ref: payments.booking_group_id > booking_groups.id [delete: cascade]
+Ref: booking_groups.checkout_id > checkouts.id [delete: restrict]
+Ref: checkouts.customer_id > users.id [delete: restrict]
+Ref: checkouts.venue_id > venues.id [delete: restrict]
+Ref: payments.checkout_id > checkouts.id [delete: cascade]
+Ref: refunds.payment_id > payments.id [delete: cascade]
 Ref: parameters.updated_by_user_id > users.id
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -661,6 +724,17 @@ Ref: parameters.updated_by_user_id > users.id
        ON user_groups (venue_id, LOWER(name))
     WHERE venue_id IS NOT NULL;
 
+   -- 14. CHECKOUTS: money is never negative, and the total is what it says.
+   ALTER TABLE checkouts
+     ADD CONSTRAINT ck_checkout_money
+     CHECK (price_centavos >= 0 AND fee_centavos >= 0
+            AND total_centavos = price_centavos + fee_centavos);
+
+   -- 15. BOOKING_GROUPS: exactly the player bookings belong to a checkout.
+   ALTER TABLE booking_groups
+     ADD CONSTRAINT ck_checkout_only_on_player_booking
+     CHECK ((type = 'PLAYER_BOOKING') = (checkout_id IS NOT NULL));
+
    ═══════════════════════════════════════════════════════════════════════════
    APPENDIX B — SEED DATA
    ═══════════════════════════════════════════════════════════════════════════
@@ -690,12 +764,12 @@ Ref: parameters.updated_by_user_id > users.id
    -- PARAMETERS  key | value | type | note
    --   default_slot_price_centavos    | 50000 | int     | PHP 500.00 fallback
    --   convenience_fee_percent        | 3.00  | decimal | online only
-   --   hold_duration_minutes          | 15    | int     |
-   --   booking_horizon_days           | 30    | int     |
+   --   hold_duration_minutes          | 5     | int     | ADR 0004
+   --   booking_horizon_days           | 14    | int     |
    --   max_active_holds_per_player    | 3     | int     |
    --   staff_backdate_days            | 7     | int     |
    --   cancellation_cutoff_minutes    | 0     | int     |
-   --   min_lead_minutes               | 20    | int     | MUST be >= hold_duration_minutes
+   --   min_lead_minutes               | 20    | int     | may be 0
    --   invitation_expiry_days         | 7     | int     |
    --   webhook_payload_retention_days | 90    | int     | RA 10173
    ═══════════════════════════════════════════════════════════════════════════ */
