@@ -92,7 +92,8 @@ check here; after a pass, update this list.
 |---|---|
 | `Button`, `buttonVariants` | every button, and links that look like one |
 | `Input`, `Label`, `Select` | form fields; `Select` replaces every native `<select>` |
-| `Alert` | errors (`role=alert`) and notices |
+| `Alert` | errors (`role=alert`) and notices that stay on the page |
+| `notify` / `Snackbars` | transient feedback after an action; mocked in tests via `@/components/ui/snackbar` |
 | `PageHeader` | breadcrumb, title, one line of context, the page's primary action |
 | `SectionLabel` | the "01 TITLE" heading of a numbered section |
 | `StatStrip` | label/value cells under a card heading, with optional meter |
