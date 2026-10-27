@@ -53,6 +53,7 @@ TableGroup inventory [note: 'What is for sale, and for how much'] {
   venues
   courts
   price_rules
+  favorite_venues
 }
 
 TableGroup booking [note: 'Occupancy of a court-hour'] {
@@ -341,6 +342,17 @@ Table courts {
   '''
 }
 
+Table favorite_venues {
+  user_id    integer     [not null]
+  venue_id   integer     [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (user_id, venue_id) [pk]
+  }
+  Note: 'A customer\'s favorite venues, for the mobile app\'s Favorites tab. No web UI yet.'
+}
+
 Table price_rules [note: '⚠️ its unique index needs NULLS NOT DISTINCT — Appendix A'] {
   id                 integer     [pk, increment]
   court_id           integer     [not null]
@@ -613,6 +625,8 @@ Ref: courts.venue_id > venues.id [delete: restrict]
 Ref: courts.created_by_user_id > users.id
 Ref: courts.updated_by_user_id > users.id
 Ref: price_rules.court_id > courts.id [delete: cascade]
+Ref: favorite_venues.user_id > users.id [delete: cascade]
+Ref: favorite_venues.venue_id > venues.id [delete: cascade]
 Ref: price_rules.created_by_user_id > users.id
 Ref: price_rules.updated_by_user_id > users.id
 
