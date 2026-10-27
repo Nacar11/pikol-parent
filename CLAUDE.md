@@ -291,6 +291,9 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
 - [`docs/adr/0003-venue-user-groups.md`](docs/adr/0003-venue-user-groups.md)
   — venue-owned user groups replace roles; Customer is a group; permissions
   are per active venue. Read before touching auth, users or groups.
+- [`docs/standard/`](docs/standard/) — repeatable procedures. Run
+  [`cleanup-pass.md`](docs/standard/cleanup-pass.md) after a feature push to
+  shrink, share and test the code without changing behaviour.
 - [`docs/plans/2026-10-27-user-groups-and-console-redesign-design.md`](docs/plans/2026-10-27-user-groups-and-console-redesign-design.md)
   and [its plan](docs/plans/2026-10-27-user-groups-and-console-redesign.md)
   — the groups work, the staff-only web and the console redesign. Complete.
