@@ -1,6 +1,6 @@
 # User Groups and Staff Console Redesign — Design
 
-Status: approved for planning, 2026-10-27. The plan built from this is
+Status: built, 2026-10-27 (see the plan's "As built" notes). The plan built from this is
 [`2026-10-27-user-groups-and-console-redesign.md`](2026-10-27-user-groups-and-console-redesign.md).
 
 ## Intent

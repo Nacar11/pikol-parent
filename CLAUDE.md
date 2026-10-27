@@ -1,9 +1,10 @@
 # pikol
 
 Pikol is a **pickleball court booking** system: one owner, many venues, many
-courts, clock-aligned hourly slots, online payment via Maya. Registered
-players book and pay online; staff book walk-ins and collect cash at the
-counter. Both paths write the same tables and pass the same constraint.
+courts, clock-aligned hourly slots, online payment via Maya. Customers book
+and pay online (through a mobile app, still to be built); staff book walk-ins
+and collect cash at the counter in the web console. Both paths write the same
+tables and pass the same constraint.
 
 This file is the **system-level** brief — it covers the whole product across
 frontend and backend. Backend-specific rules live in
@@ -25,27 +26,25 @@ its own `origin` and its own `main`.
 | Repo | GitHub | State |
 |---|---|---|
 | `pikol-parent` | `Nacar11/pikol-parent` (public) | docs only, no code |
-| `pikol-backend` | `Nacar11/pikol-backend` (public) | Phase 8 on mock Maya |
-| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | Phase 8 complete |
+| `pikol-backend` | `Nacar11/pikol-backend` (public) | user groups done, mock Maya |
+| `pikol-frontend` | `Nacar11/pikol-frontend` (public) | staff console, staff only |
 
 Keep them separated: no frontend code in the backend tree, no backend code in
 the frontend tree.
 
 ## Current state
 
-**Phases 1–4 are complete, Phase 5 runs end to end on a mock Maya, and
-Phases 6–8 (frontend foundation, the player booking flow, and the staff
-console) are complete.**
-The backend covers identity, venues and pricing, the booking core, payments
-(checkout, untrusted webhook + re-fetch, late-payment re-acquisition,
-resolution queue, receipts) and the parameters admin API. The frontend has
-every sign-in/registration/recovery screen and the full player flow: venues,
-the day grid, holds with a countdown, the pay page, the checkout return, and
-My Bookings. The staff console covers the schedule and walk-ins, booking
-actions, the resolution queue, venues and courts, pricing, closures, staff
-accounts and parameters. **Next: Phase 9, deployment.**
-The real `MayaProvider` is deferred until sandbox keys exist. The first
-`SUPER_ADMIN` comes from `uv run python -m src.users.cli
+**Phases 1–8 are complete, plus the user-groups and console-redesign work
+inserted before Phase 9** (ADR 0003). Fixed roles are gone: permissions come
+from venue-owned user groups, evaluated per active venue, and a built-in
+Customer group is what lets an account book as itself. The web is the staff
+console only — customers will use a mobile app, so the web player pages were
+removed and the backend's customer routes stay for that app. The console is
+black and white in an asima-style sidebar, with the new Schedule layout,
+Setup → Venue staff for a venue's masters, and Masters → User groups for the
+owner. **Next: Phase 9, deployment.** Until the mobile app ships, customers
+cannot book online. The real `MayaProvider` is deferred until sandbox keys
+exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.
 
 The roadmap and its phase order live in
@@ -116,13 +115,27 @@ must not retroactively change what somebody already paid.
 ### Venue scope is a mandatory parameter
 
 Asima is single-tenant and has nothing to copy here. The threat is concrete: a
-`VENUE_MANAGER` at Venue A reading Venue B's bookings.
+venue master at Venue A reading Venue B's bookings.
+
+One person may hold groups at several venues, so **every staff request names
+the venue it acts at in `X-Venue-ID`** (ADR 0003). The web console sends it on
+every request. A person working at exactly one venue may omit it; one working
+at several gets `400 VENUE_REQUIRED` without it, and a venue they hold no group
+at is `403`.
 
 ```python
-class VenueScope:          # resolved once, from the token, by a dependency
+class VenueAccess:         # resolved once per request, from token + X-Venue-ID
+    scope: VenueScope      # all venues for the owner; else exactly the header's
+    permissions: frozenset # the caller's groups AT THAT VENUE only — never summed
+    is_master: bool
+
+class VenueScope:
     all_venues: bool       # SUPER_ADMIN
-    venue_id: int | None   # VENUE_MANAGER / VENUE_STAFF
+    venue_id: int | None   # the active venue, for everyone else
 ```
+
+Permissions are **per venue, never summed**: a master at A who is front desk
+at B holds only front-desk codes while acting at B.
 
 Every repository method touching venue-owned data takes `scope: VenueScope` as
 a **required argument with no default**. Omitting it must be a `TypeError` at
@@ -130,7 +143,7 @@ call time, not a silent leak in production — the failure mode to design
 against is *forgetting*, and a missing filter looks entirely normal in review.
 
 For `/{id}` routes the check is ownership-after-fetch returning **404, not
-403** — a 403 confirms existence, which tells a manager at Venue A exactly how
+403** — a 403 confirms existence, which tells a master at Venue A exactly how
 many courts Venue B has.
 
 ### Config is not parameters
@@ -142,36 +155,52 @@ many courts Venue B has.
 
 Do not conflate them.
 
-## Roles and permissions
+## User groups and permissions
+
+There are no stored roles (ADR 0003). What someone may do is the **user groups**
+they belong to:
+
+| Group kind | Venue | How many | Who edits it |
+|---|---|---|---|
+| `CUSTOMER` | none | exactly one | the owner (members only — it holds no codes) |
+| `MASTER` | one | one per venue | the owner |
+| `STAFF` | one | any | the owner, or anyone holding `USER:Manage` at that venue |
+
+- **Customer access and staff access are independent.** Customer membership is
+  the right to book and pay as yourself (`require_customer`); staff access is a
+  venue's `MASTER`/`STAFF` groups. One account may be both — a customer in the
+  mobile app and staff in the web console.
+- **`SUPER_ADMIN` is `users.system_admin`**, an unconditional bypass orthogonal
+  to groups (asima ADR 0001). It is never a group.
+- Every venue is created with a "Venue master" and a "Front desk" group.
 
 Permission codes are `RESOURCE:Action`. The frontend gates UI from
-`GET /api/v1/users/me/permissions` (a flat string array) — never by parsing
-roles client-side. `SUPER_ADMIN` is an unconditional bypass axis, orthogonal
-to permissions (asima ADR 0001).
+`GET /api/v1/users/me/permissions` (a flat string array — the active venue's
+codes when `X-Venue-ID` is sent, the union otherwise, which the server never
+authorises on) — never by parsing anything client-side.
 
-| | SUPER_ADMIN | VENUE_MANAGER | VENUE_STAFF | PLAYER |
-|---|---|---|---|---|
-| Scope | all venues | own venue | own venue | self |
-| `VENUE:Manage` | ✅ | — | — | — |
-| `COURT:Manage` | ✅ | ✅ | — | — |
-| `PRICE:Manage` | ✅ | ✅ | — | — |
-| `CLOSURE:Manage` | ✅ | ✅ | ✅ | — |
-| `BOOKING:ReadAny` | ✅ | ✅ | ✅ | — |
-| `BOOKING:CreateWalkIn` | ✅ | ✅ | ✅ | — |
-| `BOOKING:MarkPaid` | ✅ | ✅ | ✅ | — |
-| `BOOKING:SetOutcome` | ✅ | ✅ | ✅ | — |
-| `BOOKING:CancelAny` | ✅ | ✅ | ✅ | — |
-| `USER:Manage` | ✅ | ✅ (staff only) | — | — |
-| `PARAMETER:Manage` | ✅ | — | — | — |
+| Code | Seeded on Venue master | Seeded on Front desk |
+|---|---|---|
+| `VENUE:Manage` | owner only — never on any group | |
+| `PARAMETER:Manage` | owner only — never on any group | |
+| `COURT:Manage`, `PRICE:Manage`, `USER:Manage` | ✅ | — |
+| `CLOSURE:Manage` | ✅ | ✅ |
+| `BOOKING:ReadAny`, `CreateWalkIn`, `MarkPaid`, `SetOutcome`, `CancelAny` | ✅ | ✅ |
 
-A player is `role = PLAYER` in the same `users` table, not a separate identity
-system. `parameters` moves money (fee percentage, default price), so it stays
-admin-only; a venue manager adjusts pricing through `price_rules` on their own
-courts.
+`parameters` moves money (fee percentage, default price), so it stays with the
+owner; a venue master adjusts pricing through `price_rules` on their own courts.
 
-**When a manager creates staff, `role_id` and `venue_id` are fixed by the
-server, never read from the body.** Taking them from a body the manager
-controls is how `{"role_id": 1}` makes someone a `SUPER_ADMIN`.
+**Escalation rules, enforced in the group service, each pinned by a test:**
+
+- Owner-only codes are refused for every group, by anyone — the owner too.
+- A non-owner adds or removes only codes they hold at that venue; codes they
+  don't hold stay on the group as they were.
+- Only the owner changes `MASTER` or `CUSTOMER` membership, or edits or
+  deactivates a master.
+- **The server decides a new group's venue and kind, and an invitee's venue —
+  never the request body.** Taking them from a body the caller controls is how
+  a master mints a second master or a credential at another venue.
+- Nobody removes their own last `USER:Manage` at a venue (`SELF_LOCKOUT`).
 
 ## API contract conventions
 
@@ -192,7 +221,8 @@ controls is how `{"role_id": 1}` makes someone a `SUPER_ADMIN`.
 - **Authentication is required everywhere**, including browsing availability.
 - **Transitions are actions, not PATCHes** — `POST /bookings/{id}/cancel`,
   not a status field in a generic body.
-- **Admin vs self-service is enforced by schema, never by `if (role)`.**
+- **Admin vs self-service is enforced by schema, never by `if (role)` or a
+  group name.**
   `/admin/bookings/{id}` vs `/bookings/me`; identity comes from the token,
   never from the URL. Privileged operations get their own endpoints rather
   than extra fields on a shared body.
@@ -258,6 +288,12 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
 - [`docs/adr/0002-maya-payment-provider.md`](docs/adr/0002-maya-payment-provider.md)
   — Maya replaces PayMongo: unsigned webhooks, fixed one-hour checkouts,
   decimal-peso amounts. Read before touching payments.
+- [`docs/adr/0003-venue-user-groups.md`](docs/adr/0003-venue-user-groups.md)
+  — venue-owned user groups replace roles; Customer is a group; permissions
+  are per active venue. Read before touching auth, users or groups.
+- [`docs/plans/2026-10-27-user-groups-and-console-redesign-design.md`](docs/plans/2026-10-27-user-groups-and-console-redesign-design.md)
+  and [its plan](docs/plans/2026-10-27-user-groups-and-console-redesign.md)
+  — the groups work, the staff-only web and the console redesign. Complete.
 
 ## Deployment (planned — Phase 9, not live)
 

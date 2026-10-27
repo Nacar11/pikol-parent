@@ -884,6 +884,44 @@ first, then the detail tabs.
 
 ---
 
+## As built — where the work differed from this plan
+
+Everything above landed. Where the build departed from the text, this is
+what was done and why:
+
+- **T2 also dual-writes.** New venues, sign-ups and invites wrote the group
+  tables from T2 on, not only the backfill, so the tables were complete
+  before T3 switched the guards over.
+- **Migrations carry frozen constants.** 0002 and 0006 now hold copies of
+  what they seeded. 0007 deleted the role constants, and an import would
+  have broken every fresh `alembic upgrade`.
+- **The backfill test became a round trip.** It runs inside the test's
+  rolled-back transaction, since PostgreSQL DDL is transactional:
+  - 0007's downgrade rebuilds the roles;
+  - then 0006's backfill maps them back.
+- **The venue switch resets all queries.** The plan put `venueId` in the
+  permissions key. Instead, `StaffVenueSync` resets every query on a switch,
+  so no stale data or permissions from the last venue can show.
+- **`StaffShell` lives in `features/staff`, not `components/layout`.** The
+  "To resolve" badge is passed in as a prop, because `admin-bookings`
+  already imports `staff`.
+- **Unsaved changes are guarded inline.** Group switches get a confirm
+  banner, and `beforeunload` covers leaving the page. The Next.js router
+  has no route-change hook to intercept.
+- **The Customer group gets owner search.** Its Members tab uses the owner's
+  `/admin/users?q=` search with add and remove. Master groups keep add by
+  exact email.
+- **Some dead code went too.** The old `AvailabilityGrid`, the catalog venue
+  list and `DayBookings` were removed once nothing used them.
+- **The final walkthrough is a backend test,**
+  `tests/users/test_groups_walkthrough.py`. It is repeatable and leaves the
+  developer database untouched.
+- **Not done in this session: a look in a real browser at 375 px and
+  1440 px.** It had no browser to drive. The behaviour is covered by unit
+  tests, but the visual check is still owed.
+- **Two unrelated payment tests were fixed.** They counted every row in the
+  database, so they failed on a developer database that held bookings.
+
 ## Risks and mitigations
 
 | Risk | Impact | Mitigation |
