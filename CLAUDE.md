@@ -51,7 +51,12 @@ refunded. The demo has **its own sign-in, `/customer-login-demo`**
 ([design](docs/plans/2026-10-28-customer-login-demo-design.md)): only Customer-group
 accounts get in (`POST /auth/customer-login` refuses everyone else before
 issuing a token), and `/login` is the staff console's door. Demo customers come from `uv run python -m src.devtools.demo_seed
---customers 3`. **Next: Phase 9, deployment.** The real `MayaProvider` —
+--customers 3`. **Action events** (2026-10-28,
+[design](docs/plans/2026-10-28-booking-action-events-design.md),
+[plan](docs/plans/2026-10-28-booking-action-events.md)) record every booking
+and payment change in the append-only `action_events` table, in the same
+transaction as the change, and show it as a coloured tracker to staff on the
+booking page and to customers on the result page. **Next: Phase 9, deployment.** The real `MayaProvider` —
 including `void`/`refund` — is deferred until sandbox keys exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.
 
@@ -322,6 +327,9 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
 - [`docs/plans/2026-10-28-customer-login-demo-design.md`](docs/plans/2026-10-28-customer-login-demo-design.md)
   and [its plan](docs/plans/2026-10-28-customer-login-demo.md) — the demo's own
   customer-only sign-in; `/login` becomes the staff door. Complete.
+- [`docs/plans/2026-10-28-booking-action-events-design.md`](docs/plans/2026-10-28-booking-action-events-design.md)
+  and [its plan](docs/plans/2026-10-28-booking-action-events.md) — the
+  `action_events` history and the booking tracker. Complete.
 - [`docs/standard/`](docs/standard/) — repeatable procedures. Run
   [`cleanup-pass.md`](docs/standard/cleanup-pass.md) after a feature push to
   shrink, share and test the code without changing behaviour.
