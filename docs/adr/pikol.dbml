@@ -68,6 +68,10 @@ TableGroup money [note: 'One checkout per Pay now; its payment attempt, refund a
   webhook_events
 }
 
+TableGroup history [note: 'What happened to a booking, and when'] {
+  action_events
+}
+
 TableGroup config [note: 'Business rules, tunable without a deploy'] {
   parameters
 }
@@ -134,6 +138,36 @@ Enum payment_outcome {
   FAILED     [note: 'Maya declined it. Hold released at once. Final']
   CANCELLED  [note: 'Backed out, cancelled, or the hold ended first. Can still become SUCCESSFUL or REFUNDED']
   REFUNDED   [note: 'Paid after the hold ended and an hour was taken: voided or refunded, nothing booked. Final']
+}
+
+Enum action_event_type {
+  // One per lifecycle change of a booking or its payment. Written in the
+  // SAME transaction as the change it records. "Play started" and "Hold
+  // ended" are derived on read, never stored.
+  HOLD_PLACED       [note: 'Customer pressed Pay now; hours held until expires_at']
+  WALK_IN_BOOKED    [note: 'Staff booked a walk-in: CONFIRMED/UNPAID']
+  CLOSURE_CREATED   [note: 'Staff closed a court for maintenance']
+  PAYMENT_STARTED   [note: 'Maya session opened. Checkout-level']
+  PAYMENT_SUCCEEDED [note: 'Maya says paid. Checkout-level']
+  PAYMENT_FAILED    [note: 'Maya declined. Checkout-level']
+  PAYMENT_CANCELLED [note: 'Customer backed out at Maya. Checkout-level']
+  CONFIRMED         [note: 'A player booking is booked']
+  MARKED_PAID       [note: 'Staff collected cash or GCash']
+  COMPLETED
+  NO_SHOW
+  CANCELLED         [note: 'By staff, by the customer, or by a failed payment']
+  EXPIRED           [note: 'The hold lapsed. occurred_at = its deadline, not the cleanup time']
+  REFUNDED
+  VOIDED
+  FLAGGED           [note: 'Into the resolution queue. Staff only']
+  RESOLVED          [note: 'Out of the resolution queue. Staff only']
+  REOPENED          [note: 'A closure was cancelled']
+}
+
+Enum actor_kind {
+  STAFF
+  CUSTOMER
+  SYSTEM   [note: 'Maya, the hold clock, the refund flow. No user']
 }
 
 Enum refund_kind {
@@ -584,6 +618,31 @@ Table webhook_events {
   '''
 }
 
+// ═══════════════════════════ HISTORY ═══════════════════════════
+
+Table action_events [note: '⚠️ its two CHECKs are in Appendix A'] {
+  id               bigint            [pk, increment]
+  booking_group_id integer           [null, ref: > booking_groups.id, note: 'NULL for checkout-level (payment) events']
+  checkout_id      integer           [null, ref: > checkouts.id, note: 'Set for every event of a player booking']
+  type             action_event_type [not null]
+  actor_kind       actor_kind        [not null]
+  actor_user_id    integer           [null, ref: > users.id, note: 'NULL exactly when SYSTEM — Appendix A §17']
+  occurred_at      timestamptz       [not null, note: 'When it happened. EXPIRED is dated at the hold deadline']
+  data             jsonb             [not null, default: `'{}'`, note: 'Per-type extras: reason, method, amount_centavos, expires_at, reference, late']
+
+  indexes {
+    (booking_group_id, occurred_at) [name: 'ix_action_events_group_time']
+    (checkout_id, occurred_at)      [name: 'ix_action_events_checkout_time']
+  }
+
+  Note: '''
+  APPEND-ONLY. The code inserts and reads; nothing updates or deletes.
+  Every row is written inside the transaction of the change it records, so
+  the history cannot disagree with the booking. A payment covering three
+  courts is ONE payment event (checkout_id only), not three.
+  '''
+}
+
 // ═══════════════════════════ CONFIG ═══════════════════════════
 
 Table parameters {
@@ -757,6 +816,15 @@ Ref: parameters.updated_by_user_id > users.id
    CREATE UNIQUE INDEX uq_payments_one_open_attempt
        ON payments (checkout_id)
     WHERE status = 'PENDING';
+
+   -- 17. ACTION_EVENTS: every event is about a booking or a checkout, and
+   --     only SYSTEM events have no user.
+   ALTER TABLE action_events
+     ADD CONSTRAINT ck_action_event_has_subject
+     CHECK (booking_group_id IS NOT NULL OR checkout_id IS NOT NULL);
+   ALTER TABLE action_events
+     ADD CONSTRAINT ck_action_event_actor
+     CHECK ((actor_kind = 'SYSTEM') = (actor_user_id IS NULL));
 
    ═══════════════════════════════════════════════════════════════════════════
    APPENDIX B — SEED DATA
