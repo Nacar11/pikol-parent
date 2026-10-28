@@ -47,7 +47,10 @@ repos and shared console components. The **customer booking demo**
 puts the mobile app's flow on the web under `/book`, on the same
 `/checkouts/me` API the app will use: pick hours on any courts of one venue,
 a 5-minute hold, Maya (mock), five payment statuses, late payments voided or
-refunded. Demo customers come from `uv run python -m src.devtools.demo_seed
+refunded. The demo has **its own sign-in, `/customer-login-demo`**
+([design](docs/plans/2026-10-28-customer-login-demo-design.md)): only Customer-group
+accounts get in (`POST /auth/customer-login` refuses everyone else before
+issuing a token), and `/login` is the staff console's door. Demo customers come from `uv run python -m src.devtools.demo_seed
 --customers 3`. **Next: Phase 9, deployment.** The real `MayaProvider` —
 including `void`/`refund` — is deferred until sandbox keys exist. The first `SUPER_ADMIN` comes from `uv run python -m src.users.cli
 create-super-admin`.
@@ -316,6 +319,9 @@ Filenames in `docs/plans/` must start with `YYYY-MM-DD-`.
 - [`docs/plans/2026-10-27-customer-booking-demo-design.md`](docs/plans/2026-10-27-customer-booking-demo-design.md)
   and [its plan](docs/plans/2026-10-28-customer-booking-demo.md) — the web
   booking demo, checkouts and favorites. Complete.
+- [`docs/plans/2026-10-28-customer-login-demo-design.md`](docs/plans/2026-10-28-customer-login-demo-design.md)
+  and [its plan](docs/plans/2026-10-28-customer-login-demo.md) — the demo's own
+  customer-only sign-in; `/login` becomes the staff door. Complete.
 - [`docs/standard/`](docs/standard/) — repeatable procedures. Run
   [`cleanup-pass.md`](docs/standard/cleanup-pass.md) after a feature push to
   shrink, share and test the code without changing behaviour.

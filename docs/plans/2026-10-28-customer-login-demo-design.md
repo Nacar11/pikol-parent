@@ -99,9 +99,10 @@ demo has its own login page, and the official login is the staff console's.**
 - **`landingPath`** (used by `/` and `GuestGate`) becomes: staff →
   `/staff/schedule`, else `/book`. A dual account at `/` therefore lands on the
   console.
-- **`GuestGate` is path-aware.** On `/customer-login-demo`, a signed-in customer
-  goes to `/book`; anyone else falls back to `landingPath`. This also stops it
-  racing `LoginForm`'s own redirect for a dual account.
+- **`GuestGate` is path-aware.** A safe `?next=` wins (it races
+  `LoginForm`'s own redirect, so the two must agree; added during the build).
+  Otherwise, on `/customer-login-demo`, a signed-in customer goes to `/book`;
+  anyone else falls back to `landingPath`.
 - **`AuthGate`**: a signed-out visitor on a `/book` path goes to
   `/customer-login-demo?next=…`; everything else goes to `/login?next=…` as now.
 - **`SignOutButton`** (booking shell) → `/customer-login-demo`.
